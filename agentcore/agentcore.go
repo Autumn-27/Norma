@@ -161,6 +161,14 @@ type Options struct {
 	// before falling back to resume-recovery.
 	EscalateMaxTokens bool
 
+	// DisableBackgroundTasks, when true, prevents the SDK from injecting the
+	// background-task management tools (TaskOutput, TaskStop, TaskList, Monitor)
+	// into this session's registry. Use for focused single-purpose agents (e.g.
+	// goal decomposers, structured-output callers) that should only see the tools
+	// explicitly provided in Options.Tools. The global AGENT_CORE_DISABLE_BACKGROUND_TASKS
+	// env var disables them for every session; this field is the per-session equivalent.
+	DisableBackgroundTasks bool
+
 	// Deps optionally overrides side-effect boundaries (testing/advanced use).
 	Deps harness.QueryDeps
 }
@@ -256,8 +264,9 @@ func NewSession(opts Options) *Session {
 		s.sessionID = transcript.NewSessionID()
 	}
 	// Background task execution: a per-session manager plus the tools that read and
-	// control it. Disabled via AGENT_CORE_DISABLE_BACKGROUND_TASKS.
-	if !tool.BackgroundTasksDisabled() {
+	// control it. Disabled by the global AGENT_CORE_DISABLE_BACKGROUND_TASKS env var
+	// or by setting Options.DisableBackgroundTasks for this session only.
+	if !tool.BackgroundTasksDisabled() && !opts.DisableBackgroundTasks {
 		if mgr, err := tool.NewManager(s.sessionID); err == nil {
 			s.tasks = mgr
 			tools = append(tools, tool.NewTaskOutput(), tool.NewTaskStop(), tool.NewTaskList(), tool.NewMonitor())
