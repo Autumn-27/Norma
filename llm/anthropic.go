@@ -54,7 +54,7 @@ func (p *anthropicProvider) buildBody(req CompletionRequest) ([]byte, error) {
 	}
 	body := anthropicReq{
 		Model:         p.cfg.Model,
-		Messages:      req.Messages,
+		Messages:      filterThinkingBlocks(req.Messages, p.cfg.ThinkingType != ""),
 		MaxTokens:     maxTok,
 		Temperature:   req.Temperature,
 		StopSequences: req.Stop,
@@ -154,6 +154,7 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 			Text        string `json:"text"`
 			PartialJSON string `json:"partial_json"`
 			Thinking    string `json:"thinking"`
+			Signature   string `json:"signature"`
 			StopReason  string `json:"stop_reason"`
 		} `json:"delta"`
 		Usage   *anthropicUsage `json:"usage"`
@@ -182,6 +183,8 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 			return StreamEvent{Type: SETextDelta, Text: f.Delta.Text}, true, nil
 		case "thinking_delta":
 			return StreamEvent{Type: SEThinkingDelta, Text: f.Delta.Thinking}, true, nil
+		case "signature_delta":
+			return StreamEvent{Type: SEThinkingSignature, Text: f.Delta.Signature}, true, nil
 		case "input_json_delta":
 			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta.PartialJSON}, true, nil
 		}
@@ -217,4 +220,37 @@ func (u anthropicUsage) norm() Usage {
 		CacheReadTokens:  u.CacheReadInputTokens,
 		CacheWriteTokens: u.CacheCreationInputTokens,
 	}
+}
+
+// filterThinkingBlocks removes thinking-type content blocks from message
+// history when thinking is disabled. Anthropic rejects requests that include
+// thinking blocks in history without the thinking parameter enabled.
+func filterThinkingBlocks(msgs []Message, thinkingEnabled bool) []Message {
+	if thinkingEnabled {
+		return msgs
+	}
+	out := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		hasThinking := false
+		for _, b := range m.Content {
+			if b.Type == BlockThinking {
+				hasThinking = true
+				break
+			}
+		}
+		if !hasThinking {
+			out = append(out, m)
+			continue
+		}
+		filtered := make([]ContentBlock, 0, len(m.Content))
+		for _, b := range m.Content {
+			if b.Type != BlockThinking {
+				filtered = append(filtered, b)
+			}
+		}
+		if len(filtered) > 0 {
+			out = append(out, Message{Role: m.Role, Content: filtered})
+		}
+	}
+	return out
 }

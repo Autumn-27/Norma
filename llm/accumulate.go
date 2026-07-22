@@ -14,6 +14,7 @@ type Accumulator struct {
 	toolInputs []*strings.Builder
 	textBuf    *strings.Builder
 	thinkBuf   *strings.Builder
+	thinkSig   string // signature for the current thinking block
 	StopReason string
 	Usage      Usage
 }
@@ -38,6 +39,8 @@ func (a *Accumulator) Add(ev StreamEvent) {
 			a.thinkBuf = &strings.Builder{}
 		}
 		a.thinkBuf.WriteString(ev.Text)
+	case SEThinkingSignature:
+		a.thinkSig = ev.Text
 	case SEToolUseStart:
 		a.flushText()
 		a.flushThinking()
@@ -70,9 +73,14 @@ func (a *Accumulator) flushText() {
 func (a *Accumulator) flushThinking() {
 	if a.thinkBuf != nil {
 		if s := a.thinkBuf.String(); s != "" {
-			a.blocks = append(a.blocks, ContentBlock{Type: BlockThinking, Text: s})
+			a.blocks = append(a.blocks, ContentBlock{
+				Type:      BlockThinking,
+				Thinking:  s,
+				Signature: a.thinkSig,
+			})
 		}
 		a.thinkBuf = nil
+		a.thinkSig = ""
 	}
 }
 
