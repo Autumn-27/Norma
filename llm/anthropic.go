@@ -171,7 +171,14 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 	switch f.Type {
 	case "message_start":
 		if f.Message.Usage != nil {
-			return StreamEvent{Type: SEMessageStart, Usage: f.Message.Usage.norm()}, true, nil
+			// Anthropic reports the full input side (input + cache read/creation) in
+			// BOTH message_start and message_delta. To avoid double-counting when the
+			// accumulator folds both events, message_start carries ONLY the input side
+			// and message_delta carries ONLY output. The initial output_tokens here is
+			// a placeholder (≈1), so drop it — the real output comes from message_delta.
+			u := f.Message.Usage.norm()
+			u.OutputTokens = 0
+			return StreamEvent{Type: SEMessageStart, Usage: u}, true, nil
 		}
 	case "content_block_start":
 		if f.ContentBlock.Type == "tool_use" {
@@ -191,7 +198,10 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 	case "message_delta":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: f.Delta.StopReason}
 		if f.Usage != nil {
-			ev.Usage = f.Usage.norm()
+			// Only output here — the input side (input/cache) was already counted at
+			// message_start; message_delta re-echoes it, so counting it again would
+			// double the input/cache totals.
+			ev.Usage = Usage{OutputTokens: f.Usage.OutputTokens}
 		}
 		return ev, true, nil
 	case "message_stop":
@@ -213,9 +223,13 @@ type anthropicUsage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
+// norm maps Anthropic usage to the canonical Usage. InputTokens is the TOTAL input
+// INCLUDING cached tokens (OpenAI-style: prompt_tokens semantics) — Anthropic's raw
+// input_tokens counts only the non-cached portion, so cache read+creation are folded
+// in. CacheReadTokens/CacheWriteTokens are the cached SUBSET (⊆ InputTokens).
 func (u anthropicUsage) norm() Usage {
 	return Usage{
-		InputTokens:      u.InputTokens,
+		InputTokens:      u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens,
 		OutputTokens:     u.OutputTokens,
 		CacheReadTokens:  u.CacheReadInputTokens,
 		CacheWriteTokens: u.CacheCreationInputTokens,
