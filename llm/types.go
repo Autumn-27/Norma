@@ -32,8 +32,14 @@ const (
 type ContentBlock struct {
 	Type BlockType `json:"type"`
 
-	// Text / Thinking.
+	// Text block.
 	Text string `json:"text,omitempty"`
+
+	// Thinking block (extended thinking). Anthropic requires the field to be
+	// named "thinking" (not "text") and requires "signature" when replaying
+	// the block in multi-turn history.
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
 
 	// ToolUse: a model request to invoke a tool.
 	ID    string          `json:"id,omitempty"`

@@ -17,7 +17,8 @@ type StreamEventType string
 const (
 	SEMessageStart  StreamEventType = "message_start"
 	SETextDelta     StreamEventType = "text_delta"
-	SEThinkingDelta StreamEventType = "thinking_delta"
+	SEThinkingDelta     StreamEventType = "thinking_delta"
+	SEThinkingSignature StreamEventType = "thinking_signature"
 	SEToolUseStart  StreamEventType = "tool_use_start"
 	SEToolInputJSON StreamEventType = "tool_input_delta"
 	SEMessageDelta  StreamEventType = "message_delta" // carries stop_reason / usage
