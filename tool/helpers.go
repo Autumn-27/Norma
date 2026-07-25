@@ -43,7 +43,7 @@ func Capture(tc *ToolContext, s string) string {
 			}
 			lines := strings.Count(s, "\n") + 1
 			return s[:max] + fmt.Sprintf(
-				"\n\n... [output truncated: full %d bytes / %d lines saved to %s — read slices with `grep`/`sed -n`, do not cat the whole file] ...",
+				"\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>",
 				len(s), lines, ref)
 		}
 	}
