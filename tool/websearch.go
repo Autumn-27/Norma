@@ -63,8 +63,7 @@ func NewWebSearch(cfg WebSearchConfig) (CoreTool, error) {
 	}
 	return Build(Spec{
 		Name:        "web_search",
-		Description: "Search the web and return a ranked list of results (title, URL, description). Returns up to 5 results by default. This returns result metadata only — use WebFetch to read the full content of a specific URL.",
-		Prompt:      "Provide a search query. Returns titles, URLs and descriptions only (no page content) — follow up with WebFetch on a URL to read it. This tool makes an external network request.",
+		Description: "Search the web and return a ranked list of results (title, URL, description) — metadata only, up to 5 by default. Use WebFetch to read the full content of a specific URL. This makes an external network request.",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

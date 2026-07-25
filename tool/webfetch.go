@@ -44,8 +44,7 @@ type WebFetchConfig struct {
 func NewWebFetch(cfg WebFetchConfig) CoreTool {
 	return Build(Spec{
 		Name:        "WebFetch",
-		Description: "Fetches a URL over HTTP(S) and returns its content as Markdown (HTML is converted; non-HTML returned as-is). Set extract=true to also surface HTML comments, <script> sources, inline endpoints, forms/inputs and meta tags. Use for documentation, API responses, and web pages the user references.",
-		Prompt:      "Provide an absolute http(s) URL. Set extract=true to also append a RECON section (HTML comments, script sources, inline endpoints, forms/inputs incl. hidden, links, meta) — useful for security recon. Large responses are truncated. This tool makes an external network request.",
+		Description: "Fetches a web page over HTTP(S) and returns its content as Markdown (HTML is converted; other document types returned as-is). Set extract=true to also surface HTML comments, <script>/CSS sources, inline endpoints, forms/inputs and meta tags (it lists asset URLs, it does not fetch them). For HTML pages, documentation, and API responses — not static assets (.js, .css, images, fonts). Large responses are truncated; this makes an external network request.",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
