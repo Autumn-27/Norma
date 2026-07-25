@@ -48,7 +48,7 @@ func NewWebFetch(cfg WebFetchConfig) CoreTool {
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"url":     map[string]any{"type": "string", "description": "The absolute http(s) URL to fetch."},
+				"url":     map[string]any{"type": "string", "description": "The absolute http(s) URL to fetch. JS/CSS/static-asset suffix URLs are not allowed."},
 				"extract": map[string]any{"type": "boolean", "description": "When true, append a RECON section preserving HTML comments, <script src>, inline-script endpoints, forms/inputs (including hidden), links and meta tags. Default false."},
 			},
 			"required": []any{"url"},
