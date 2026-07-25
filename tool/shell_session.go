@@ -298,8 +298,8 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 	if cols <= 0 {
 		cols = sessDefCols
 	}
-	shell, flag := shellCmd()
-	cmd := exec.CommandContext(m.rootCtx, shell, flag, command)
+	shell, flags := shellCmd()
+	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, command)...)
 	cmd.Dir = workDir
 	if e := withEnv(env); e != nil {
 		cmd.Env = e

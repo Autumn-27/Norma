@@ -227,8 +227,8 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	if kind == "" {
 		kind = KindBash
 	}
-	shell, flag := shellCmd()
-	cmd := exec.CommandContext(m.rootCtx, shell, flag, spec.Command)
+	shell, flags := shellCmd()
+	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, spec.Command)...)
 	cmd.Dir = spec.WorkingDir
 	if env := withEnv(spec.Env); env != nil {
 		cmd.Env = env
@@ -558,12 +558,16 @@ func tailFile(path string, maxBytes int) (string, error) {
 	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + string(b), nil
 }
 
-// shellCmd returns the platform shell and its command flag.
-func shellCmd() (string, string) {
+// shellCmd returns the platform shell and the argument flags that precede the
+// command string. On Windows it uses PowerShell with -NoProfile -NonInteractive
+// (the command is passed to -Command) so a user profile can't inject banners or
+// prompts and an interactive prompt can't hang an unattended run. Elsewhere it
+// uses `bash -c`.
+func shellCmd() (string, []string) {
 	if runtime.GOOS == "windows" {
-		return "cmd", "/c"
+		return "powershell", []string{"-NoProfile", "-NonInteractive", "-Command"}
 	}
-	return "bash", "-c"
+	return "bash", []string{"-c"}
 }
 
 // short trims a command to a compact single-line label for summaries.
