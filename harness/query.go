@@ -449,6 +449,13 @@ func (l *loop) run() {
 		resultMsg := llm.Message{Role: llm.RoleUser, Content: results}
 		l.messages = append(l.messages, resultMsg)
 		l.record(resultMsg, llm.Usage{})
+		// Extra messages a tool injected after its result (e.g. the Skill tool's
+		// instructions as an independent user message) are appended next so the
+		// next model round sees them as standing guidance.
+		for _, em := range exec.extraMessages() {
+			l.messages = append(l.messages, em)
+			l.record(em, llm.Usage{})
+		}
 		// Surface any background-task completions that landed during this turn so
 		// the next model round sees them alongside the tool results.
 		l.injectTaskNotifications()

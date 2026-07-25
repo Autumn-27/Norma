@@ -51,6 +51,74 @@ func TestAutoCompactIsNonDestructive(t *testing.T) {
 	}
 }
 
+func TestAutoCompactReinjectsInvokedSkills(t *testing.T) {
+	c := New(smallWindow(), func(_ context.Context, msgs []llm.Message) (string, error) {
+		return "DIGEST", nil
+	})
+	// An old skill invocation, then enough bulk to push it behind the boundary.
+	skillMsg := llm.SkillInvocationMessage("deploy", "/skills/deploy", "1. build\n2. ship")
+	msgs := []llm.Message{skillMsg}
+	for i := 0; i < 8; i++ {
+		msgs = append(msgs, bigMsg(llm.RoleUser, 4000))
+	}
+	out, ok := c.autoCompact(context.Background(), msgs, 1234, "auto")
+	if !ok {
+		t.Fatal("autoCompact did not run")
+	}
+	// The skill instructions must appear in the API view (post-boundary), verbatim,
+	// even though the transcript copy was summarized to "DIGEST".
+	api := llm.MessagesForAPI(out)
+	var found bool
+	for _, m := range api {
+		if name, ok := llm.SkillInvocationName(m); ok && name == "deploy" && strings.Contains(m.Text(), "1. build") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("invoked skill 'deploy' was not re-injected into the post-boundary API view")
+	}
+}
+
+func TestReinjectSkillsDedupesAndSkipsTail(t *testing.T) {
+	// Two invocations of the same skill behind the boundary → keep only the latest.
+	old := llm.SkillInvocationMessage("x", "", "OLD BODY")
+	newer := llm.SkillInvocationMessage("x", "", "NEW BODY")
+	// A different skill whose only invocation is in the preserved tail → not re-injected.
+	tail := llm.SkillInvocationMessage("y", "", "TAIL BODY")
+	msgs := []llm.Message{old, newer, bigMsg(llm.RoleUser, 10), tail}
+	tailStart := 3 // msgs[3:] is the preserved tail
+
+	got := reinjectSkills(msgs, tailStart)
+	if len(got) != 1 {
+		t.Fatalf("want 1 re-injected skill (latest x, y skipped), got %d", len(got))
+	}
+	if name, _ := llm.SkillInvocationName(got[0]); name != "x" {
+		t.Fatalf("want skill x, got %q", name)
+	}
+	if !strings.Contains(got[0].Text(), "NEW BODY") || strings.Contains(got[0].Text(), "OLD BODY") {
+		t.Fatalf("should keep the latest invocation body, got %q", got[0].Text())
+	}
+}
+
+func TestReinjectSkillsTruncatesToBudget(t *testing.T) {
+	huge := strings.Repeat("z", maxSkillReinjectTokens*4*3) // ~3x the per-skill char cap
+	msgs := []llm.Message{
+		llm.SkillInvocationMessage("big", "", huge),
+		bigMsg(llm.RoleUser, 10),
+	}
+	got := reinjectSkills(msgs, 1)
+	if len(got) != 1 {
+		t.Fatalf("want 1 re-injected skill, got %d", len(got))
+	}
+	if EstimateTokens(got) > maxSkillReinjectTokens+50 {
+		t.Fatalf("re-injected skill not truncated to per-skill budget: %d tokens", EstimateTokens(got))
+	}
+	if !strings.Contains(got[0].Text(), "truncated") {
+		t.Fatal("truncated skill should carry a truncation note")
+	}
+}
+
 func TestCircuitBreakerTrips(t *testing.T) {
 	c := New(smallWindow(), func(context.Context, []llm.Message) (string, error) {
 		return "", errors.New("boom")

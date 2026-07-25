@@ -22,6 +22,9 @@ type BoundaryMeta struct {
 	PreTokens int `json:"pre_tokens"`
 	// MessagesSummarized is how many messages were condensed into the summary.
 	MessagesSummarized int `json:"messages_summarized,omitempty"`
+	// ActiveSkills names the invoked skills re-injected verbatim after this
+	// boundary (diagnostics; the instructions themselves ride in the messages).
+	ActiveSkills []string `json:"active_skills,omitempty"`
 }
 
 // BoundaryMessage builds a compact-boundary marker carrying its metadata. It

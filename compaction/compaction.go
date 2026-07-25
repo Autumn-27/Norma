@@ -16,6 +16,7 @@ package compaction
 
 import (
 	"context"
+	"sort"
 	"strings"
 
 	"github.com/Autumn-27/norma/llm"
@@ -319,21 +320,105 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 	}
 	c.failures = 0
 
+	// Skill instructions in the summarized head are lossy in the prose summary, so
+	// re-inject the latest invocation of each skill verbatim just after the summary
+	// (post-boundary → sent to the model). Retained history keeps the originals; we
+	// only re-surface skills that fell behind the new boundary.
+	reinjected := reinjectSkills(msgs, tailStart)
 	boundary := llm.BoundaryMessage(llm.BoundaryMeta{
 		Trigger:            trigger,
 		PreTokens:          preTok,
 		MessagesSummarized: len(toSummarize),
+		ActiveSkills:       skillNames(reinjected),
 	})
 	summaryMsg := llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{
 		llm.TextBlock("[conversation summarized to save context]\n\n" + summary),
 	}}
 	// Retain everything before tailStart (non-destructive); insert the new
-	// boundary + summary just before the preserved recent tail.
-	out := make([]llm.Message, 0, len(msgs)+2)
+	// boundary + summary (+ re-injected skills) just before the preserved recent tail.
+	out := make([]llm.Message, 0, len(msgs)+2+len(reinjected))
 	out = append(out, msgs[:tailStart]...)
 	out = append(out, boundary, summaryMsg)
+	out = append(out, reinjected...)
 	out = append(out, msgs[tailStart:]...)
 	return out, true
+}
+
+// Skill re-injection budget: per-skill and total token caps for verbatim skill
+// instructions re-surfaced after a compaction boundary (mirrors claude-code's
+// 5K/25K policy). Most-recently-invoked skills win when the total is exceeded.
+const (
+	maxSkillReinjectTokens      = 5000
+	maxSkillReinjectTotalTokens = 25000
+)
+
+// skillNames returns the invoked-skill names of the given re-injected messages.
+func skillNames(msgs []llm.Message) []string {
+	var out []string
+	for _, m := range msgs {
+		if name, ok := llm.SkillInvocationName(m); ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// reinjectSkills finds the latest invocation of each skill in the history behind
+// the new boundary (msgs[:tailStart]) and returns copies to place after the
+// summary, newest-first under budget, restored to chronological order. A skill
+// whose latest invocation is already in the preserved tail (index >= tailStart)
+// is skipped — it is still in the model's view.
+func reinjectSkills(msgs []llm.Message, tailStart int) []llm.Message {
+	type entry struct {
+		msg llm.Message
+		idx int
+	}
+	latest := map[string]*entry{}
+	var order []string
+	for i, m := range msgs {
+		name, ok := llm.SkillInvocationName(m)
+		if !ok {
+			continue
+		}
+		if e, seen := latest[name]; seen {
+			e.msg, e.idx = m, i
+		} else {
+			latest[name] = &entry{msg: m, idx: i}
+			order = append(order, name)
+		}
+	}
+	if len(latest) == 0 {
+		return nil
+	}
+	// Candidates whose latest invocation fell behind the boundary, newest-first.
+	var cands []*entry
+	for _, name := range order {
+		if e := latest[name]; e.idx < tailStart {
+			cands = append(cands, e)
+		}
+	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].idx > cands[b].idx })
+
+	kept := make([]*entry, 0, len(cands))
+	total := 0
+	for _, e := range cands {
+		m := llm.TruncateSkillMessage(e.msg, maxSkillReinjectTokens*4)
+		t := EstimateTokens([]llm.Message{m})
+		if total+t > maxSkillReinjectTotalTokens {
+			continue // drop this one; a smaller, older skill may still fit
+		}
+		total += t
+		kept = append(kept, &entry{msg: m, idx: e.idx})
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	sort.Slice(kept, func(a, b int) bool { return kept[a].idx < kept[b].idx })
+	out := make([]llm.Message, 0, len(kept))
+	for _, e := range kept {
+		out = append(out, e.msg)
+	}
+	return out
 }
 
 // --- L1 Snip: drop oldest working-set messages (last resort) ---

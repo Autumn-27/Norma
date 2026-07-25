@@ -50,7 +50,8 @@ const summaryRequestPrompt = `Summarize the conversation above into the followin
 6. All User Messages — a list of the user's explicit instructions, in order.
 7. Pending Tasks — what remains to be done.
 8. Current Work — exactly what was being worked on at the moment of summarization.
-9. Next Step — the single most logical next action.`
+9. Next Step — the single most logical next action.
+10. Active Skills — any skill invoked in the conversation that is still in effect, named, with the key guidelines it imposed (so its procedure is not lost).`
 
 func transcriptLine(m llm.Message) string {
 	var parts []string

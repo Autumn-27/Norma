@@ -34,6 +34,7 @@ type tracked struct {
 	safe   bool
 	status toolStatus
 	result llm.ContentBlock
+	extra  []llm.Message // messages the tool injects after its result (Result.Extra)
 	prog   []string
 }
 
@@ -95,7 +96,7 @@ func (e *streamExec) processQueue() {
 func (e *streamExec) run(t *tracked) {
 	e.l.sem <- struct{}{} // bound concurrent tool execution
 	defer func() { <-e.l.sem }()
-	res := e.l.execOne(t.block, func(p tool.ProgressInfo) {
+	res, extra := e.l.execOne(t.block, func(p tool.ProgressInfo) {
 		e.mu.Lock()
 		t.prog = append(t.prog, p.Message)
 		e.mu.Unlock()
@@ -103,6 +104,7 @@ func (e *streamExec) run(t *tracked) {
 	})
 	e.mu.Lock()
 	t.result = res
+	t.extra = extra
 	t.status = stCompleted
 	e.mu.Unlock()
 	e.ping()
@@ -217,6 +219,21 @@ func (e *streamExec) results() []llm.ContentBlock {
 			out[i] = t.result
 		} else {
 			out[i] = llm.ToolResultText(t.block.ID, "tool execution interrupted", true)
+		}
+	}
+	return out
+}
+
+// extraMessages returns, in tool arrival order, the extra messages tools chose
+// to inject after their tool_result (Result.Extra). Empty for the common case
+// where no tool injects anything.
+func (e *streamExec) extraMessages() []llm.Message {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []llm.Message
+	for _, t := range e.tools {
+		if (t.status == stCompleted || t.status == stYielded) && len(t.extra) > 0 {
+			out = append(out, t.extra...)
 		}
 	}
 	return out

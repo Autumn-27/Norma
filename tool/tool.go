@@ -51,6 +51,11 @@ func (tc *ToolContext) progress(msg string) {
 type Result struct {
 	Content []llm.ContentBlock
 	IsError bool
+	// Extra holds additional messages the tool injects into the conversation
+	// right after its tool_result (e.g. the Skill tool emits the invoked skill's
+	// instructions as an independent user message rather than burying them in the
+	// tool_result). Appended in order; nil for ordinary tools.
+	Extra []llm.Message
 }
 
 // Text builds a successful text result.

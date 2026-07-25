@@ -13,8 +13,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	"github.com/Autumn-27/norma/tool"
+	"gopkg.in/yaml.v3"
 )
 
 // Skill is one invokable instruction package.
@@ -84,23 +86,23 @@ func (r *Registry) List() []Skill {
 }
 
 // Tool returns the Skill tool bound to this registry. Invoking it with a skill
+// Listing budget: the available-skills block is regenerated every turn inside
+// the Skill tool's prompt, so a large registry would inflate context on every
+// request. Cap the total and clip over-long descriptions; once the budget is hit
+// the remaining skills degrade to name-only (never dropped — the model must
+// still be able to invoke them).
+const (
+	maxSkillListingChars = 8000
+	maxSkillDescChars    = 500
+)
+
 // name returns that skill's instructions for the agent to follow.
 func (r *Registry) Tool() tool.CoreTool {
-	var avail strings.Builder
-	for _, s := range r.List() {
-		// Description is the primary discovery field per the agentskills.io spec;
-		// it should already describe "what + when to use". Fall back to WhenToUse
-		// only for legacy skills that haven't been updated yet.
-		desc := s.Description
-		if desc == "" {
-			desc = s.WhenToUse
-		}
-		fmt.Fprintf(&avail, "\n- %s: %s", s.Name, desc)
-	}
+	avail := r.listing()
 	return tool.Build(tool.Spec{
 		Name:        "Skill",
 		Description: "Invokes a named skill — a reusable procedure — and returns its step-by-step instructions for you to follow. Use a skill when the task matches one of the available skills below.",
-		Prompt:      "Available skills:" + avail.String(),
+		Prompt:      "Available skills:" + avail,
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -130,23 +132,32 @@ func (r *Registry) Tool() tool.CoreTool {
 			if s.Dir != "" {
 				instructions = strings.ReplaceAll(instructions, "${SKILL_DIR}", s.Dir)
 			}
-			var out string
-			if s.Dir != "" {
-				out = fmt.Sprintf("Skill: %s\nBase directory: %s\n\n%s", s.Name, s.Dir, instructions)
-			} else {
-				out = fmt.Sprintf("Skill: %s\n\n%s", s.Name, instructions)
-			}
+			// The skill's body — instructions plus any caller-supplied context. This
+			// travels in an independent user message (Result.Extra) rather than the
+			// tool_result, so it reads as standing guidance and so compaction can
+			// re-inject it verbatim after a summary boundary (see llm.SkillInvocationMessage
+			// + compaction re-injection).
+			body := instructions
 			if strings.TrimSpace(in.Args) != "" {
-				out += "\n\n## Additional context from the caller\n\n" + in.Args
+				body += "\n\n## Additional context from the caller\n\n" + in.Args
 			}
-			// Host hook: reveal + unlock this skill's MCPs (and any other on-load
-			// side effects). Its return text is appended to the instructions.
+			invocation := llm.SkillInvocationMessage(s.Name, s.Dir, body)
+
+			// The tool_result itself is a short acknowledgement pointing at the
+			// injected guidance message.
+			ack := fmt.Sprintf("Skill %q loaded. Its instructions were added to the conversation as a separate guidance message — follow them.", s.Name)
+			// Host hook: reveal + unlock this skill's MCPs (and any other on-load side
+			// effects). Its return text is transient disclosure (deferred-tool names are
+			// re-rendered in the system prompt each turn), so it rides on the tool_result.
 			if r.OnInvoke != nil {
 				if extra := r.OnInvoke(s); extra != "" {
-					out += "\n\n" + extra
+					ack += "\n\n" + extra
 				}
 			}
-			return tool.Text(out), nil
+			return tool.Result{
+				Content: []llm.ContentBlock{llm.TextBlock(ack)},
+				Extra:   []llm.Message{invocation},
+			}, nil
 		},
 	})
 }
@@ -155,6 +166,39 @@ func (r *Registry) names() []string {
 	out := append([]string(nil), r.order...)
 	sort.Strings(out)
 	return out
+}
+
+// listing renders the available-skills block ("- name: description" per skill),
+// clipping long descriptions and degrading to name-only once maxSkillListingChars
+// is reached. Skills are never dropped — the model must be able to invoke each.
+func (r *Registry) listing() string {
+	var b strings.Builder
+	used := 0
+	namesOnly := false
+	for _, s := range r.List() {
+		// Description is the primary discovery field per the agentskills.io spec;
+		// it should already describe "what + when to use". Fall back to WhenToUse
+		// only for legacy skills that haven't been updated yet.
+		desc := s.Description
+		if desc == "" {
+			desc = s.WhenToUse
+		}
+		if len(desc) > maxSkillDescChars {
+			desc = desc[:maxSkillDescChars] + "…"
+		}
+		line := "\n- " + s.Name
+		if !namesOnly {
+			full := line + ": " + desc
+			if used+len(full) > maxSkillListingChars {
+				namesOnly = true // this and all following skills go name-only
+			} else {
+				line = full
+			}
+		}
+		b.WriteString(line)
+		used += len(line)
+	}
+	return b.String()
 }
 
 // LoadDir loads skills from a directory. Each skill is a subdirectory containing
@@ -198,10 +242,24 @@ func LoadDir(dir string) (*Registry, error) {
 	return r, nil
 }
 
-// parse extracts YAML frontmatter and body from a SKILL.md file.
-// Recognised frontmatter keys follow the agentskills.io specification:
-// name, description, license, compatibility.
-// whenToUse / when_to_use are also parsed for backwards compatibility.
+// frontmatter is the YAML head of a SKILL.md. Recognised keys follow the
+// agentskills.io specification (name, description, license, compatibility);
+// whenToUse / when_to_use and mcps / mcp are accepted for compatibility.
+type frontmatter struct {
+	Name          string       `yaml:"name"`
+	Description   string       `yaml:"description"`
+	License       string       `yaml:"license"`
+	Compatibility string       `yaml:"compatibility"`
+	WhenToUse     string       `yaml:"whenToUse"`
+	WhenToUseUS   string       `yaml:"when_to_use"`
+	MCPs          stringOrList `yaml:"mcps"`
+	MCP           stringOrList `yaml:"mcp"`
+}
+
+// parse extracts YAML frontmatter and body from a SKILL.md file using a real
+// YAML parser (multi-line values, quoted colons, block/flow lists all work).
+// Malformed frontmatter degrades gracefully: the fields stay empty and the body
+// still loads, so a bad header never drops the whole skill.
 func parse(s string) Skill {
 	var sk Skill
 	body := s
@@ -210,25 +268,19 @@ func parse(s string) Skill {
 		if i := strings.Index(rest, "\n---"); i >= 0 {
 			head := rest[:i]
 			body = strings.TrimLeft(rest[i+len("\n---"):], "-\r\n")
-			for _, line := range strings.Split(head, "\n") {
-				k, v, ok := strings.Cut(line, ":")
-				if !ok {
-					continue
+			var fm frontmatter
+			if err := yaml.Unmarshal([]byte(head), &fm); err == nil {
+				sk.Name = fm.Name
+				sk.Description = fm.Description
+				sk.License = fm.License
+				sk.Compatibility = fm.Compatibility
+				sk.WhenToUse = fm.WhenToUse
+				if sk.WhenToUse == "" {
+					sk.WhenToUse = fm.WhenToUseUS
 				}
-				k, v = strings.TrimSpace(k), strings.TrimSpace(v)
-				switch k {
-				case "name":
-					sk.Name = v
-				case "description":
-					sk.Description = v
-				case "license":
-					sk.License = v
-				case "compatibility":
-					sk.Compatibility = v
-				case "whenToUse", "when_to_use":
-					sk.WhenToUse = v
-				case "mcps", "mcp":
-					sk.MCPs = parseList(v)
+				sk.MCPs = fm.MCPs
+				if sk.MCPs == nil {
+					sk.MCPs = fm.MCP
 				}
 			}
 		}
@@ -237,8 +289,34 @@ func parse(s string) Skill {
 	return sk
 }
 
-// parseList parses a frontmatter list value in either inline form:
-// "a, b" or "[a, b]" (quotes optional) → ["a","b"].
+// stringOrList accepts a frontmatter value written either as a scalar
+// ("a" or "a, b") or as a YAML list ([a, b] / block form) and normalises it to a
+// trimmed, non-empty []string.
+type stringOrList []string
+
+func (s *stringOrList) UnmarshalYAML(value *yaml.Node) error {
+	var str string
+	if err := value.Decode(&str); err == nil {
+		*s = parseList(str)
+		return nil
+	}
+	var list []string
+	if err := value.Decode(&list); err == nil {
+		out := make([]string, 0, len(list))
+		for _, p := range list {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		if len(out) > 0 {
+			*s = out
+		}
+		return nil
+	}
+	return nil // unparseable → leave nil rather than fail the whole skill
+}
+
+// parseList splits a scalar list value ("a, b" or "[a, b]", quotes optional).
 func parseList(v string) []string {
 	v = strings.TrimSpace(v)
 	v = strings.TrimPrefix(v, "[")

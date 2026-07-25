@@ -10,19 +10,21 @@ import (
 )
 
 // execOne resolves, permission-checks, and runs a single tool call, returning a
-// tool_result block. It never panics; failures become error results. It is safe
-// to call from the streaming executor's goroutines (read-only access to loop
-// config; permission/hook callbacks are the host's responsibility to make safe).
-func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) llm.ContentBlock {
+// tool_result block and any extra messages the tool injects after its result
+// (Result.Extra — e.g. the Skill tool's instructions message). It never panics;
+// failures become error results. It is safe to call from the streaming
+// executor's goroutines (read-only access to loop config; permission/hook
+// callbacks are the host's responsibility to make safe).
+func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
 	t, ok := l.in.Tools.Get(use.Name)
 	if !ok {
-		return llm.ToolResultText(use.ID, fmt.Sprintf("Error: unknown tool %q", use.Name), true)
+		return llm.ToolResultText(use.ID, fmt.Sprintf("Error: unknown tool %q", use.Name), true), nil
 	}
 	input := use.Input
 
 	// Schema validation (FR-04.5).
 	if err := tool.ValidateInput(t.InputSchema(), input); err != nil {
-		return llm.ToolResultText(use.ID, "Error: invalid tool input: "+err.Error(), true)
+		return llm.ToolResultText(use.ID, "Error: invalid tool input: "+err.Error(), true), nil
 	}
 
 	mode := l.in.PermissionMode
@@ -48,7 +50,7 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 		if msg == "" {
 			msg = "denied"
 		}
-		return llm.ToolResultText(use.ID, "Tool call was not permitted: "+msg, true)
+		return llm.ToolResultText(use.ID, "Tool call was not permitted: "+msg, true), nil
 	}
 	if len(dec.UpdatedInput) > 0 {
 		input = dec.UpdatedInput
@@ -57,7 +59,7 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 	// Pre-tool hook.
 	if l.in.Hooks != nil {
 		if block, msg, updated := l.in.Hooks.PreToolUse(l.ctx, use.Name, input); block {
-			return llm.ToolResultText(use.ID, "Blocked by hook: "+msg, true)
+			return llm.ToolResultText(use.ID, "Blocked by hook: "+msg, true), nil
 		} else if len(updated) > 0 {
 			input = updated
 		}
@@ -86,5 +88,5 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 	if len(content) == 0 {
 		content = []llm.ContentBlock{llm.TextBlock("(no output)")}
 	}
-	return llm.ContentBlock{Type: llm.BlockToolResult, ToolUseID: use.ID, Content: content, IsError: res.IsError}
+	return llm.ContentBlock{Type: llm.BlockToolResult, ToolUseID: use.ID, Content: content, IsError: res.IsError}, res.Extra
 }
