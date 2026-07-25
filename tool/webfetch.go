@@ -44,7 +44,7 @@ type WebFetchConfig struct {
 func NewWebFetch(cfg WebFetchConfig) CoreTool {
 	return Build(Spec{
 		Name:        "WebFetch",
-		Description: "Fetches a web page over HTTP(S) and returns its content as Markdown (HTML is converted; other document types returned as-is). Set extract=true to also surface HTML comments, <script>/CSS sources, inline endpoints, forms/inputs and meta tags (it lists asset URLs, it does not fetch them). For HTML pages, documentation, and API responses — not static assets (.js, .css, images, fonts). Large responses are truncated; this makes an external network request.",
+		Description: "Fetches an HTTP(S) HTML page, documentation page, or API response and returns it as Markdown. Do not use this tool for static assets, including JavaScript, CSS, source maps, images, fonts, audio, or video—even if their URLs are found in a fetched page or explicitly requested. Fetch the owning page instead. Set `extract=true` to list comments, scripts, stylesheets, endpoints, forms, links, and meta tags. Listed asset URLs are for inspection only and must not be fetched. Large responses may be truncated. This makes an external network request.",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -124,6 +124,37 @@ func proxyLikelyErr(err error) bool {
 	return false
 }
 
+// staticAssetExts are file extensions WebFetch refuses: linked resources (scripts,
+// styles, source maps, images, fonts, media, wasm) that are not page content.
+var staticAssetExts = map[string]bool{
+	".js": true, ".mjs": true, ".cjs": true, ".css": true, ".map": true,
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".svg": true,
+	".webp": true, ".avif": true, ".ico": true, ".bmp": true,
+	".woff": true, ".woff2": true, ".ttf": true, ".otf": true, ".eot": true,
+	".wasm": true, ".mp4": true, ".webm": true, ".mp3": true, ".wav": true, ".ogg": true,
+}
+
+// staticAssetExt returns the offending extension (with dot) if rawURL points at a
+// static asset, or "" otherwise. The query string and fragment are ignored, so
+// "/app.js?v=3" is still caught.
+func staticAssetExt(rawURL string) string {
+	path := rawURL
+	if u, err := url.Parse(rawURL); err == nil {
+		path = u.Path
+	}
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		path = path[i+1:] // last segment only
+	}
+	dot := strings.LastIndexByte(path, '.')
+	if dot < 0 {
+		return ""
+	}
+	if ext := strings.ToLower(path[dot:]); staticAssetExts[ext] {
+		return ext
+	}
+	return ""
+}
+
 func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *ToolContext) (Result, error) {
 	client := newFetchClient(cfg)
 	// direct is the no-proxy fallback used when a proxied fetch fails for a
@@ -144,6 +175,9 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 		}
 		if !strings.HasPrefix(in.URL, "http://") && !strings.HasPrefix(in.URL, "https://") {
 			return Errorf("Error: url must start with http:// or https://"), nil
+		}
+		if ext := staticAssetExt(in.URL); ext != "" {
+			return Errorf("Error: WebFetch does not fetch static assets (" + ext + " file). It reads HTML pages, documentation, and API responses — not linked resources like scripts, styles, images, or fonts. Fetch the page that references this asset instead."), nil
 		}
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()

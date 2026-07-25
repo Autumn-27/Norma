@@ -118,6 +118,37 @@ func TestWebFetch(t *testing.T) {
 	}
 }
 
+func TestWebFetchRejectsStaticAssets(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Write([]byte("console.log(1)"))
+	}))
+	defer srv.Close()
+
+	// .js/.css (and with a query string), images, fonts → rejected before any request.
+	for _, path := range []string{"/app.js", "/main.css", "/bundle.min.js?v=3", "/logo.png", "/font.woff2"} {
+		raw, _ := json.Marshal(map[string]any{"url": srv.URL + path})
+		res, err := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+		if err != nil {
+			t.Fatalf("webfetch %s: %v", path, err)
+		}
+		if !res.IsError || !strings.Contains(res.Flatten(), "static asset") {
+			t.Fatalf("%s should be rejected as a static asset, got: %q (isErr=%v)", path, res.Flatten(), res.IsError)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("no network request should be made for static assets, got %d", hits)
+	}
+
+	// A normal page path still works.
+	raw, _ := json.Marshal(map[string]any{"url": srv.URL + "/docs/guide"})
+	res, _ := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+	if res.IsError {
+		t.Fatalf("normal page path should not be rejected: %q", res.Flatten())
+	}
+}
+
 func TestProxyLikelyErr(t *testing.T) {
 	// Proxy/MITM-caused failures → a direct retry may help.
 	for _, s := range []string{
