@@ -45,6 +45,7 @@ func TestFileTools(t *testing.T) {
 }
 
 func TestSearchTools(t *testing.T) {
+	t.Setenv("NORMA_DISABLE_RIPGREP", "1")
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "one.go"), []byte("package main\nfunc Foo(){}\n"), 0o644)
 	os.WriteFile(filepath.Join(dir, "two.txt"), []byte("Foo lives\n"), 0o644)
@@ -59,11 +60,12 @@ func TestSearchTools(t *testing.T) {
 }
 
 func TestGrepContextLines(t *testing.T) {
+	t.Setenv("NORMA_DISABLE_RIPGREP", "1")
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\nb\nMATCH\nd\ne\n"), 0o644)
 	// -C 1 should include the line before and after the match, with the match
 	// line using ':' and context lines using '-'.
-	res := run(t, NewGrep(), dir, map[string]any{"pattern": "MATCH", "-C": 1})
+	res := run(t, NewGrep(), dir, map[string]any{"pattern": "MATCH", "output_mode": "content", "-C": 1})
 	out := res.Flatten()
 	for _, want := range []string{"f.txt-2-b", "f.txt:3:MATCH", "f.txt-4-d"} {
 		if !strings.Contains(out, want) {
@@ -72,6 +74,60 @@ func TestGrepContextLines(t *testing.T) {
 	}
 	if strings.Contains(out, "f.txt-1-a") {
 		t.Fatalf("-C 1 should not reach line 1:\n%s", out)
+	}
+}
+
+func TestGrepTypeFilter(t *testing.T) {
+	t.Setenv("NORMA_DISABLE_RIPGREP", "1")
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.go"), []byte("needle here\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "b.py"), []byte("needle here\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "c.txt"), []byte("needle here\n"), 0o644)
+
+	// type: go → only the .go file.
+	out := run(t, NewGrep(), dir, map[string]any{"pattern": "needle", "type": "go"}).Flatten()
+	if !strings.Contains(out, "a.go") || strings.Contains(out, "b.py") || strings.Contains(out, "c.txt") {
+		t.Fatalf("type=go filter: %q", out)
+	}
+	// Unknown type falls back to *.<type>.
+	out = run(t, NewGrep(), dir, map[string]any{"pattern": "needle", "type": "txt"}).Flatten()
+	if !strings.Contains(out, "c.txt") || strings.Contains(out, "a.go") {
+		t.Fatalf("type=txt fallback: %q", out)
+	}
+}
+
+func TestGrepMultiline(t *testing.T) {
+	t.Setenv("NORMA_DISABLE_RIPGREP", "1")
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("start\nalpha\nbeta\nend\n"), 0o644)
+
+	// Without multiline, a cross-line pattern doesn't match.
+	out := run(t, NewGrep(), dir, map[string]any{"pattern": "alpha.*beta", "output_mode": "files_with_matches"}).Flatten()
+	if strings.Contains(out, "f.txt") {
+		t.Fatalf("cross-line pattern should not match without multiline: %q", out)
+	}
+	// With multiline, . spans the newline.
+	out = run(t, NewGrep(), dir, map[string]any{"pattern": "alpha.*beta", "multiline": true, "output_mode": "files_with_matches"}).Flatten()
+	if !strings.Contains(out, "f.txt") {
+		t.Fatalf("multiline should match across lines: %q", out)
+	}
+}
+
+func TestGrepHeadLimitAndOffset(t *testing.T) {
+	t.Setenv("NORMA_DISABLE_RIPGREP", "1")
+	dir := t.TempDir()
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		os.WriteFile(filepath.Join(dir, n+".txt"), []byte("hit\n"), 0o644)
+	}
+	// head_limit caps the number of files and notes the remainder.
+	out := run(t, NewGrep(), dir, map[string]any{"pattern": "hit", "head_limit": 2}).Flatten()
+	if strings.Count(out, ".txt") != 2 || !strings.Contains(out, "more result") {
+		t.Fatalf("head_limit=2 should keep 2 and note the rest: %q", out)
+	}
+	// offset pages past the first results.
+	out = run(t, NewGrep(), dir, map[string]any{"pattern": "hit", "head_limit": 2, "offset": 2}).Flatten()
+	if !strings.Contains(out, "c.txt") || strings.Contains(out, "a.txt") {
+		t.Fatalf("offset=2 should skip a/b and show c: %q", out)
 	}
 }
 
