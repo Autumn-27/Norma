@@ -88,7 +88,43 @@ func runRead(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 		}
 		return Text("(no lines in the requested range)"), nil
 	}
-	return Text(Capture(tc, b.String())), nil
+	return Text(readCapture(tc, b.String(), start)), nil
+}
+
+// readOutputBonus lifts the Read tool's output budget above the shared default
+// (ToolContext.MaxOutputChars): Read gets a little more room before truncating.
+const readOutputBonus = 1000
+
+// readCapture bounds Read's line-numbered output. When it exceeds the Read budget
+// (MaxToolOutputChars + readOutputBonus) it cuts at a line boundary and tells the
+// model the exact offset to continue from — the source file is already on disk, so
+// there is no need to spill a copy: the model just pages on with Read(offset=…).
+// start is the 0-based line the output began at.
+func readCapture(tc *ToolContext, s string, start int) string {
+	max := maxOut(tc) + readOutputBonus
+	if len(s) <= max {
+		return s
+	}
+	head, headLines := headWithinBudget(s, max)
+	nextOffset := start + headLines + 1 // 1-based file line to continue from
+	return head + fmt.Sprintf(
+		"\n... [Read truncated to fit the output limit. Continue reading the file with Read offset=%d (and an optional limit), or narrow with Grep/`sed -n`.] ...",
+		nextOffset)
+}
+
+// headWithinBudget returns the largest whole-line prefix of s within max bytes and
+// the number of lines it contains. Falls back to a hard cut if a single line
+// already exceeds the budget (no newline within reach).
+func headWithinBudget(s string, max int) (string, int) {
+	if len(s) <= max {
+		return s, strings.Count(s, "\n")
+	}
+	cut := strings.LastIndexByte(s[:max], '\n')
+	if cut < 0 {
+		return s[:max], 0
+	}
+	head := s[:cut+1]
+	return head, strings.Count(head, "\n")
 }
 
 // isBinary reports whether data looks like a binary (non-text) file, using the

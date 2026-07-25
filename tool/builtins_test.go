@@ -33,6 +33,51 @@ func TestReadHardening(t *testing.T) {
 	}
 }
 
+func TestReadTruncationGuidesOffset(t *testing.T) {
+	dir := t.TempDir()
+	body := strings.Repeat("padding line of some length\n", 300) + "TAILMARKER\n"
+	os.WriteFile(filepath.Join(dir, "big.txt"), []byte(body), 0o644)
+
+	raw, _ := json.Marshal(map[string]any{"file_path": "big.txt"})
+	// Small MaxOutputChars forces truncation; effective budget = 200 + readOutputBonus.
+	res, err := NewRead().Call(context.Background(), raw, &ToolContext{WorkingDir: dir, MaxOutputChars: 200})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	out := res.Flatten()
+
+	if !strings.Contains(out, "truncated to fit the output limit") || !strings.Contains(out, "offset=") {
+		t.Fatalf("missing truncation + offset guidance: %q", out)
+	}
+	// The +readOutputBonus(1000) lifts the budget well above MaxOutputChars(200).
+	if len(out) <= 200 {
+		t.Fatalf("Read budget should exceed MaxOutputChars by the bonus; got len=%d", len(out))
+	}
+	// Head is line-bounded and the tail line is not shown.
+	if strings.Contains(out, "TAILMARKER") {
+		t.Fatalf("tail line should not appear after truncation: %q", out)
+	}
+}
+
+func TestReadTruncationDoesNotSpill(t *testing.T) {
+	dir := t.TempDir()
+	spill := t.TempDir()
+	body := strings.Repeat("padding line of some length\n", 300)
+	os.WriteFile(filepath.Join(dir, "big.txt"), []byte(body), 0o644)
+
+	raw, _ := json.Marshal(map[string]any{"file_path": "big.txt"})
+	// Even with an OutputDir configured, Read does not spill a copy — the source
+	// file is on disk, so it just guides the model to page on with offset.
+	res, _ := NewRead().Call(context.Background(), raw, &ToolContext{WorkingDir: dir, OutputDir: spill, MaxOutputChars: 200})
+	out := res.Flatten()
+	if !strings.Contains(out, "offset=") || strings.Contains(out, "saved to") {
+		t.Fatalf("Read should guide offset without spilling: %q", out)
+	}
+	if files, _ := os.ReadDir(spill); len(files) != 0 {
+		t.Fatalf("Read must not spill to OutputDir, found %d file(s)", len(files))
+	}
+}
+
 func TestWriteCreatedVsOverwrote(t *testing.T) {
 	dir := t.TempDir()
 	if r := run(t, NewWrite(), dir, map[string]any{"file_path": "f.txt", "content": "a"}); !strings.Contains(r.Flatten(), "Created") {
