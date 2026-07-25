@@ -450,6 +450,7 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		Settlement:         s.opts.Settlement,
 		MaxConcurrency:     s.opts.MaxConcurrency,
 		WorkingDir:         s.opts.WorkingDir,
+		Todos:              s.opts.Todos,
 		ToolOutputDir:      s.opts.ToolOutputDir,
 		MaxToolOutputChars: s.opts.MaxToolOutputChars,
 		Tasks:              s.tasks,

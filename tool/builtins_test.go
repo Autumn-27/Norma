@@ -136,10 +136,29 @@ func TestLS(t *testing.T) {
 func TestTodoWrite(t *testing.T) {
 	store := NewTodoStore()
 	st := store.Tool()
-	st.Call(context.Background(), []byte(`{"todos":[{"content":"build","status":"in_progress"},{"content":"test","status":"pending"}]}`), &ToolContext{})
+	res, _ := st.Call(context.Background(), []byte(`{"todos":[{"content":"build","status":"in_progress"},{"content":"test","status":"pending"}]}`), &ToolContext{})
 	items := store.List()
 	if len(items) != 2 || items[0].Status != TodoInProgress {
 		t.Fatalf("todos: %+v", items)
+	}
+	// tool_result is an ack, not the list (the list rides the tool_use input and
+	// the todo system-reminder).
+	if !strings.Contains(res.Flatten(), "successfully") || strings.Contains(res.Flatten(), "build") {
+		t.Fatalf("expected ack without the list, got: %q", res.Flatten())
+	}
+}
+
+func TestRenderTodoReminder(t *testing.T) {
+	if RenderTodoReminder(nil) != "" {
+		t.Fatal("empty list should render as empty string")
+	}
+	out := RenderTodoReminder([]Todo{
+		{Content: "build", Status: TodoInProgress},
+		{Content: "test", Status: TodoPending},
+	})
+	want := "1. [in_progress] build\n2. [pending] test"
+	if out != want {
+		t.Fatalf("render:\n got %q\nwant %q", out, want)
 	}
 }
 

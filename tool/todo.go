@@ -85,26 +85,25 @@ func (s *TodoStore) Tool() CoreTool {
 				return Result{}, err
 			}
 			s.set(in.Todos)
-			return Text(renderTodos(in.Todos)), nil
+			// Ack only — the list itself is visible in the model's own tool_use
+			// input and is re-surfaced on demand via the todo system-reminder
+			// (harness). Mirrors claude-code's TodoWrite result.
+			return Text(todoAck), nil
 		},
 	})
 }
 
-func renderTodos(todos []Todo) string {
+const todoAck = "Todos have been modified successfully. Keep the todo list current and continue with the tasks."
+
+// RenderTodoReminder renders the todo list for the system-reminder body, one
+// numbered item per line ("N. [status] content"). Returns "" for an empty list.
+func RenderTodoReminder(todos []Todo) string {
 	if len(todos) == 0 {
-		return "(todo list cleared)"
+		return ""
 	}
 	var b strings.Builder
-	b.WriteString("Todos updated:\n")
-	for _, t := range todos {
-		box := "[ ]"
-		switch t.Status {
-		case TodoCompleted:
-			box = "[x]"
-		case TodoInProgress:
-			box = "[~]"
-		}
-		fmt.Fprintf(&b, "%s %s\n", box, t.Content)
+	for i, t := range todos {
+		fmt.Fprintf(&b, "%d. [%s] %s\n", i+1, t.Status, t.Content)
 	}
-	return b.String()
+	return strings.TrimRight(b.String(), "\n")
 }

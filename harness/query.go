@@ -50,6 +50,16 @@ type QueryInput struct {
 	// tool turns so the model learns when background work finishes.
 	Tasks *tool.Manager
 
+	// Todos, when non-nil, enables todo system-reminders: when the model hasn't
+	// used TodoWrite for TodoReminderTurnsSinceWrite turns (and it's been at least
+	// TodoReminderTurnsBetweenReminder turns since the last reminder), the current
+	// list is re-surfaced as a <system-reminder> user message. Throttle turns are
+	// derived by scanning the API-visible history, so it survives compaction and
+	// resume. 0 thresholds default to 10/10 (mirrors claude-code).
+	Todos                            *tool.TodoStore
+	TodoReminderTurnsSinceWrite      int
+	TodoReminderTurnsBetweenReminder int
+
 	// BashEnv holds extra "KEY=VALUE" entries injected into Bash subprocess
 	// environments (foreground + background). Empty = inherit unchanged.
 	BashEnv []string
@@ -597,11 +607,97 @@ func (l *loop) checkBudgetContinue() bool {
 	return false
 }
 
+// Todo system-reminder throttle defaults (mirror claude-code's TODO_REMINDER_CONFIG).
+const (
+	defaultTodoTurnsSinceWrite = 10
+	defaultTodoTurnsBetween    = 10
+)
+
+func (l *loop) todoTurnsSinceWrite() int {
+	if l.in.TodoReminderTurnsSinceWrite > 0 {
+		return l.in.TodoReminderTurnsSinceWrite
+	}
+	return defaultTodoTurnsSinceWrite
+}
+
+func (l *loop) todoTurnsBetween() int {
+	if l.in.TodoReminderTurnsBetweenReminder > 0 {
+		return l.in.TodoReminderTurnsBetweenReminder
+	}
+	return defaultTodoTurnsBetween
+}
+
+// maybeInjectTodoReminder appends a todo <system-reminder> user message to the
+// history when the model has gone long enough without touching TodoWrite and
+// without a recent reminder. Throttle turns are derived from the API-visible
+// window (post-boundary) so a reminder re-appears after compaction drops the
+// prior one. No-op when todos are disabled or the list is empty.
+func (l *loop) maybeInjectTodoReminder() {
+	if l.in.Todos == nil {
+		return
+	}
+	todos := l.in.Todos.List()
+	if len(todos) == 0 {
+		return
+	}
+	sinceWrite, sinceReminder := todoReminderTurnCounts(llm.MessagesForAPI(l.messages))
+	if sinceWrite < l.todoTurnsSinceWrite() || sinceReminder < l.todoTurnsBetween() {
+		return
+	}
+	body := tool.RenderTodoReminder(todos)
+	if body == "" {
+		return
+	}
+	msg := llm.TodoReminderMessage(body)
+	l.messages = append(l.messages, msg)
+	l.record(msg, llm.Usage{})
+}
+
+// todoReminderTurnCounts scans messages (most-recent first) and returns the
+// number of assistant turns since the last TodoWrite tool_use and since the last
+// todo reminder. The turn that contains the TodoWrite is not itself counted (so
+// the call turn reads as 0). A never-seen event yields the total assistant-turn
+// count (effectively "long ago").
+func todoReminderTurnCounts(msgs []llm.Message) (sinceWrite, sinceReminder int) {
+	foundWrite, foundReminder := false, false
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if !foundReminder && llm.IsTodoReminder(m) {
+			foundReminder = true
+			continue
+		}
+		if m.Role != llm.RoleAssistant {
+			continue
+		}
+		if !foundWrite {
+			if messageHasToolUse(m, "TodoWrite") {
+				foundWrite = true
+			} else {
+				sinceWrite++
+			}
+		}
+		if !foundReminder {
+			sinceReminder++
+		}
+	}
+	return
+}
+
+func messageHasToolUse(m llm.Message, name string) bool {
+	for _, b := range m.Content {
+		if b.Type == llm.BlockToolUse && b.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // streamAndExecute runs one model completion, surfacing text/thinking, and feeds
 // tool_use blocks to the streaming executor as they finish — so tools begin
 // running while the rest of the message is still arriving. It returns the
 // assembled assistant message, the executor, the stop reason, and flags.
 func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
+	l.maybeInjectTodoReminder()
 	msgs := llm.MessagesForAPI(l.messages)
 	if l.in.SystemReminder != "" {
 		msgs = append([]llm.Message{llm.UserText(l.in.SystemReminder)}, msgs...)
