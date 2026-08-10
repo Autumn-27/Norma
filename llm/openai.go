@@ -12,10 +12,11 @@ import (
 type openaiProvider struct{ cfg Config }
 
 type oaMessage struct {
-	Role       string       `json:"role"`
-	Content    string       `json:"content,omitempty"`
-	ToolCalls  []oaToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string       `json:"tool_call_id,omitempty"`
+	Role             string       `json:"role"`
+	Content          string       `json:"content,omitempty"`
+	ReasoningContent string       `json:"reasoning_content,omitempty"`
+	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string       `json:"tool_call_id,omitempty"`
 }
 
 type oaToolCall struct {
@@ -69,10 +70,16 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 		case RoleAssistant:
 			om := oaMessage{Role: "assistant"}
 			var text strings.Builder
+			var reasoning strings.Builder
 			for _, b := range m.Content {
 				switch b.Type {
 				case BlockText:
 					text.WriteString(b.Text)
+				case BlockThinking:
+					// DeepSeek-style thinking mode requires the previous turn's
+					// reasoning_content to be passed back verbatim; dropping it
+					// makes the API reject the request with a 400.
+					reasoning.WriteString(b.Text)
 				case BlockToolUse:
 					tc := oaToolCall{ID: b.ID, Type: "function"}
 					tc.Function.Name = b.Name
@@ -84,6 +91,15 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 				}
 			}
 			om.Content = text.String()
+			if s := reasoning.String(); s != "" {
+				om.ReasoningContent = s
+			}
+			// A thinking-only turn (reasoning but no visible content and no
+			// tool calls) must still carry a non-empty content or tool_calls —
+			// some providers reject an assistant message with neither.
+			if om.Content == "" && len(om.ToolCalls) == 0 {
+				om.Content = "…"
+			}
 			out = append(out, om)
 		case RoleUser:
 			var text strings.Builder
