@@ -84,6 +84,15 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 				}
 			}
 			om.Content = text.String()
+			// OpenAI requires an assistant message to carry content or
+			// tool_calls. A turn that produced only thinking (reasoning), or
+			// an empty/truncated turn, has neither once thinking is stripped
+			// here — and Content's omitempty would drop an empty string, so
+			// the message would serialize to {"role":"assistant"} and the API
+			// rejects it with 400 "content or tool_calls must be set". Skip it.
+			if om.Content == "" && len(om.ToolCalls) == 0 {
+				continue
+			}
 			out = append(out, om)
 		case RoleUser:
 			var text strings.Builder

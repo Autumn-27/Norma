@@ -324,7 +324,7 @@ func (l *loop) maxTokens() int {
 	if l.in.MaxTokens > 0 {
 		return l.in.MaxTokens
 	}
-	return 8192
+	return 32768
 }
 
 func (l *loop) run() {

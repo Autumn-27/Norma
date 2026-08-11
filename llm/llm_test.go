@@ -198,3 +198,92 @@ func TestToOpenAIMessagesThreadsToolResults(t *testing.T) {
 		t.Fatalf("pairing wrong: %+v", oa)
 	}
 }
+
+// A thinking-only (or empty) assistant turn must not serialize to a bare
+// {"role":"assistant"} message — OpenAI rejects that with 400 "content or
+// tool_calls must be set". It should be skipped entirely.
+func TestToOpenAIMessagesSkipsEmptyAssistant(t *testing.T) {
+	msgs := []Message{
+		UserText("hi"),
+		{Role: RoleAssistant, Content: []ContentBlock{
+			{Type: BlockThinking, Thinking: "pondering, no answer emitted"},
+		}},
+		UserText("still there?"),
+	}
+	oa := toOpenAIMessages("", msgs)
+	for _, m := range oa {
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+			t.Fatalf("emitted empty assistant message: %+v", oa)
+		}
+	}
+	// The two user turns survive; the empty assistant is dropped.
+	if len(oa) != 2 {
+		t.Fatalf("want 2 messages, got %d: %+v", len(oa), oa)
+	}
+}
+
+// filterThinkingBlocks must drop messages left with no content — Anthropic
+// rejects an empty content array. Covers both a thinking-only turn collapsing
+// once thinking is stripped and a genuinely empty (truncated) turn.
+func TestFilterThinkingBlocksDropsEmpty(t *testing.T) {
+	msgs := []Message{
+		UserText("hi"),
+		{Role: RoleAssistant, Content: []ContentBlock{{Type: BlockThinking, Thinking: "only thinking"}}},
+		{Role: RoleAssistant, Content: []ContentBlock{}}, // empty/truncated turn
+		UserText("bye"),
+	}
+
+	// Thinking disabled: thinking-only turn collapses to empty and drops; the
+	// already-empty turn drops too. Two user turns remain.
+	got := filterThinkingBlocks(msgs, false)
+	if len(got) != 2 {
+		t.Fatalf("thinking-disabled: want 2, got %d: %+v", len(got), got)
+	}
+	for _, m := range got {
+		if len(m.Content) == 0 {
+			t.Fatalf("thinking-disabled: emitted empty message: %+v", got)
+		}
+	}
+
+	// Thinking enabled: the thinking-only turn is kept (valid, must be
+	// replayed); only the genuinely empty turn drops. Three messages remain.
+	got = filterThinkingBlocks(msgs, true)
+	if len(got) != 3 {
+		t.Fatalf("thinking-enabled: want 3, got %d: %+v", len(got), got)
+	}
+	for _, m := range got {
+		if len(m.Content) == 0 {
+			t.Fatalf("thinking-enabled: emitted empty message: %+v", got)
+		}
+	}
+}
+
+// Dropping an empty assistant that sat between a tool result and a resume nudge
+// leaves two adjacent user turns; mergeAdjacentSameRole must coalesce them so
+// the sequence still alternates (Anthropic rejects non-alternating roles).
+func TestMergeAdjacentSameRoleAfterDrop(t *testing.T) {
+	history := []Message{
+		{Role: RoleAssistant, Content: []ContentBlock{
+			{Type: BlockText, Text: "calling"},
+			{Type: BlockToolUse, ID: "c1", Name: "Bash", Input: []byte(`{"command":"ls"}`)},
+		}},
+		{Role: RoleUser, Content: []ContentBlock{ToolResultText("c1", "file.txt", false)}},
+		{Role: RoleAssistant, Content: []ContentBlock{}}, // empty/truncated turn → dropped
+		UserText("continue where you left off"),           // resume nudge
+	}
+
+	merged := mergeAdjacentSameRole(filterThinkingBlocks(history, false))
+
+	// assistant(tool_use) → user(tool_result + nudge, coalesced). Alternation holds.
+	if len(merged) != 2 {
+		t.Fatalf("want 2 messages, got %d: %+v", len(merged), merged)
+	}
+	for i := 1; i < len(merged); i++ {
+		if merged[i].Role == merged[i-1].Role {
+			t.Fatalf("adjacent same-role at %d: %+v", i, merged)
+		}
+	}
+	if merged[1].Role != RoleUser || len(merged[1].Content) != 2 {
+		t.Fatalf("user turns not coalesced: %+v", merged[1])
+	}
+}

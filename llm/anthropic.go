@@ -54,7 +54,7 @@ func (p *anthropicProvider) buildBody(req CompletionRequest) ([]byte, error) {
 	}
 	body := anthropicReq{
 		Model:         p.cfg.Model,
-		Messages:      filterThinkingBlocks(req.Messages, p.cfg.ThinkingType != ""),
+		Messages:      mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, p.cfg.ThinkingType != "")),
 		MaxTokens:     maxTok,
 		Temperature:   req.Temperature,
 		StopSequences: req.Stop,
@@ -236,35 +236,60 @@ func (u anthropicUsage) norm() Usage {
 	}
 }
 
-// filterThinkingBlocks removes thinking-type content blocks from message
-// history when thinking is disabled. Anthropic rejects requests that include
-// thinking blocks in history without the thinking parameter enabled.
+// filterThinkingBlocks normalizes message history before it is sent to the
+// Anthropic Messages API. It strips thinking-type content blocks when thinking
+// is disabled (Anthropic rejects replayed thinking blocks without the thinking
+// parameter enabled), and drops any message left with no content blocks —
+// Anthropic rejects an empty content array. An empty message arrives here two
+// ways: a thinking-only turn that collapses to empty once thinking is stripped,
+// or an empty/truncated assistant turn (only reasoning, or nothing) that was
+// recorded with no text or tool_use. (A thinking-only turn WITH thinking
+// enabled keeps its thinking block — that is valid content and must be
+// replayed.)
 func filterThinkingBlocks(msgs []Message, thinkingEnabled bool) []Message {
-	if thinkingEnabled {
-		return msgs
-	}
 	out := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
-		hasThinking := false
-		for _, b := range m.Content {
-			if b.Type == BlockThinking {
-				hasThinking = true
-				break
+		content := m.Content
+		if !thinkingEnabled {
+			filtered := make([]ContentBlock, 0, len(content))
+			for _, b := range content {
+				if b.Type != BlockThinking {
+					filtered = append(filtered, b)
+				}
 			}
+			content = filtered
 		}
-		if !hasThinking {
+		if len(content) == 0 {
+			continue // empty content array is rejected by Anthropic — drop it
+		}
+		if len(content) == len(m.Content) {
 			out = append(out, m)
+		} else {
+			out = append(out, Message{Role: m.Role, Content: content})
+		}
+	}
+	return out
+}
+
+// mergeAdjacentSameRole coalesces consecutive same-role messages into one by
+// concatenating their content blocks. Anthropic requires messages to alternate
+// user/assistant; dropping an empty turn in filterThinkingBlocks can leave two
+// adjacent user messages (e.g. a tool result followed by a resume nudge, once
+// the empty assistant between them is gone), which the API would reject with
+// "roles must alternate". Merging preserves alternation without losing content.
+// A fresh content slice is built on merge so the caller's message backing
+// arrays are never mutated.
+func mergeAdjacentSameRole(msgs []Message) []Message {
+	out := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if n := len(out); n > 0 && out[n-1].Role == m.Role {
+			merged := make([]ContentBlock, 0, len(out[n-1].Content)+len(m.Content))
+			merged = append(merged, out[n-1].Content...)
+			merged = append(merged, m.Content...)
+			out[n-1].Content = merged
 			continue
 		}
-		filtered := make([]ContentBlock, 0, len(m.Content))
-		for _, b := range m.Content {
-			if b.Type != BlockThinking {
-				filtered = append(filtered, b)
-			}
-		}
-		if len(filtered) > 0 {
-			out = append(out, Message{Role: m.Role, Content: filtered})
-		}
+		out = append(out, m)
 	}
 	return out
 }
