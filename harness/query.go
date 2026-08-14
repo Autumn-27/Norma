@@ -30,15 +30,15 @@ type QueryInput struct {
 	// tool schemas sent as usual.
 	DeferredTools []string
 	MaxTokens     int
-	Temperature     *float64
+	Temperature   *float64
 	// MaxTurns bounds tool-turns (0 = off). MaxDuration bounds wall-clock time,
 	// checked at the turn boundary so a turn is never aborted mid-stream — unlike
 	// cancelling ctx, which cuts an in-flight stream/tool (0 = off).
-	MaxTurns        int
-	MaxDuration     time.Duration
-	MaxConcurrency  int
-	WorkingDir      string
-	AgentID         string
+	MaxTurns       int
+	MaxDuration    time.Duration
+	MaxConcurrency int
+	WorkingDir     string
+	AgentID        string
 	// ToolOutputDir, when set, makes oversized tool output spill to a file there
 	// (full content kept) instead of being discarded; MaxToolOutputChars sets the
 	// per-tool output budget (head size; 0 = default 30000). See tool.Capture.
@@ -78,8 +78,8 @@ type QueryInput struct {
 	// Recorder, when non-nil, is notified as the conversation grows so a host can
 	// persist a transcript. It fires for genuinely new messages (births) in
 	// order, and for compaction boundaries; it is never called for compaction's
-	// ephemeral working-set edits (collapse/snip), so the recorded transcript is
-	// the raw, full-fidelity history.
+	// ephemeral working-set edits (MicroCompact tool-result clearing), so the
+	// recorded transcript is the raw, full-fidelity history.
 	Recorder Recorder
 
 	// TokenBudget, when > 0, enables budget-driven continuation: after a turn
@@ -126,7 +126,10 @@ func (s *Settlement) promptFor(reason TerminalReason) string {
 // package compaction). Compaction is non-destructive; the harness sends only
 // llm.MessagesForAPI(messages) to the model.
 type Compactor interface {
-	Pre(ctx context.Context, msgs []llm.Message) []llm.Message
+	// Pre conditions the history before a model request. lastInputTokens is the
+	// total token size the previous model response reported (0 if none yet), used
+	// as the initial gate count in preference to local estimation.
+	Pre(ctx context.Context, msgs []llm.Message, lastInputTokens int) []llm.Message
 	Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Message, bool)
 	IsOverflow(err error) bool
 }
@@ -196,11 +199,12 @@ type loop struct {
 	yield func(Event, error) bool
 	sem   chan struct{} // bounds concurrent tool execution
 
-	messages      []llm.Message
-	usage         llm.Usage
-	turnCount     int
-	boundaryCount int // boundary markers already seen, so Recorder fires once each
-	startTime     time.Time // loop start, for MaxDuration (wall-clock budget)
+	messages        []llm.Message
+	usage           llm.Usage
+	lastInputTokens int // total token size the previous model response reported (compaction gate)
+	turnCount       int
+	boundaryCount   int       // boundary markers already seen, so Recorder fires once each
+	startTime       time.Time // loop start, for MaxDuration (wall-clock budget)
 
 	// settlement (wrap-up) phase state, entered when a budget is hit
 	settling     bool
@@ -355,9 +359,9 @@ func (l *loop) run() {
 			return
 		}
 
-		// Non-destructive proactive compaction (snip/micro/collapse/auto).
+		// Non-destructive proactive compaction (MicroCompact → AutoCompact).
 		if l.in.Compactor != nil {
-			l.messages = l.in.Compactor.Pre(l.ctx, l.messages)
+			l.messages = l.in.Compactor.Pre(l.ctx, l.messages, l.lastInputTokens)
 			l.recordNewBoundary()
 		}
 
@@ -371,7 +375,7 @@ func (l *loop) run() {
 				l.finish(ReasonAbortedStreaming, l.ctx.Err(), "")
 				return
 			}
-			// Reactive recovery from prompt-too-long (collapse → compact → snip).
+			// Reactive recovery from prompt-too-long: one forced AutoCompact, then retry.
 			if l.in.Compactor != nil && l.in.Compactor.IsOverflow(streamErr) && !l.hasAttemptedReactiveCompact {
 				l.hasAttemptedReactiveCompact = true
 				if msgs, ok := l.in.Compactor.Reactive(l.ctx, l.messages); ok {
@@ -388,7 +392,11 @@ func (l *loop) run() {
 		}
 		l.hasAttemptedReactiveCompact = false
 		l.messages = append(l.messages, asst)
-		l.record(asst, usageDelta(usageBefore, l.usage))
+		turnUsage := usageDelta(usageBefore, l.usage)
+		// The size the model just reported for its input, preferred by the
+		// compactor over local estimation on the next turn's gate check.
+		l.lastInputTokens = turnUsage.InputTokens + turnUsage.OutputTokens
+		l.record(asst, turnUsage)
 		// surface cumulative usage after each model turn so hosts can show live token
 		// counts during a run (not just at the terminal event).
 		if u := l.usage; u != (llm.Usage{}) {

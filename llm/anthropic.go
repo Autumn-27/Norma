@@ -52,9 +52,19 @@ func (p *anthropicProvider) buildBody(req CompletionRequest) ([]byte, error) {
 	if maxTok == 0 {
 		maxTok = 8192
 	}
+	// Effective thinking mode: a non-empty per-request override (req.Thinking)
+	// wins over Config.ThinkingType. Thinking-type content blocks may be replayed
+	// only when thinking is actively "enabled"; any other mode (incl. "disabled")
+	// strips them so Anthropic does not reject the request.
+	thinkingType := p.cfg.ThinkingType
+	thinkingEnabled := thinkingType != ""
+	if req.Thinking != "" {
+		thinkingType = req.Thinking
+		thinkingEnabled = req.Thinking == "enabled"
+	}
 	body := anthropicReq{
 		Model:         p.cfg.Model,
-		Messages:      mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, p.cfg.ThinkingType != "")),
+		Messages:      mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, thinkingEnabled)),
 		MaxTokens:     maxTok,
 		Temperature:   req.Temperature,
 		StopSequences: req.Stop,
@@ -64,8 +74,8 @@ func (p *anthropicProvider) buildBody(req CompletionRequest) ([]byte, error) {
 	for _, t := range req.Tools {
 		body.Tools = append(body.Tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
 	}
-	if p.cfg.ThinkingType != "" {
-		body.Thinking = &anthropicThinking{Type: p.cfg.ThinkingType}
+	if thinkingType != "" {
+		body.Thinking = &anthropicThinking{Type: thinkingType}
 	}
 	if p.cfg.ReasoningEffort != "" {
 		body.OutputConfig = &anthropicOutputConfig{Effort: p.cfg.ReasoningEffort}

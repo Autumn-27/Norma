@@ -24,7 +24,7 @@ func TestBackgroundTaskEndToEnd(t *testing.T) {
 	turns := [][]llm.StreamEvent{
 		toolTurn("b1", "Bash", `{"command":"sleep 1; echo e2e-out","run_in_background":true}`),
 		textTurn("launched"), // completes prompt #1 while the task is still running
-		textTurn("ack"),       // prompt #2; the notification is drained before this turn
+		textTurn("ack"),      // prompt #2; the notification is drained before this turn
 	}
 	var n int
 	callModel := func(_ context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {

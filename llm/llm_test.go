@@ -269,7 +269,7 @@ func TestMergeAdjacentSameRoleAfterDrop(t *testing.T) {
 		}},
 		{Role: RoleUser, Content: []ContentBlock{ToolResultText("c1", "file.txt", false)}},
 		{Role: RoleAssistant, Content: []ContentBlock{}}, // empty/truncated turn → dropped
-		UserText("continue where you left off"),           // resume nudge
+		UserText("continue where you left off"),          // resume nudge
 	}
 
 	merged := mergeAdjacentSameRole(filterThinkingBlocks(history, false))

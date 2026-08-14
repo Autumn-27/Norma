@@ -135,4 +135,10 @@ type CompletionRequest struct {
 	MaxTokens       int
 	Temperature     *float64
 	Stop            []string
+	// Thinking overrides the provider's thinking mode for THIS request only:
+	// "" inherits Config.ThinkingType; "enabled"/"disabled" force that mode.
+	// Compaction's summary call sets "disabled" so the summarizer never spends
+	// tokens on reasoning and never replays thinking blocks (which Anthropic
+	// rejects when thinking is off).
+	Thinking string
 }

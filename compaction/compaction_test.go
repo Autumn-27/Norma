@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -138,29 +139,64 @@ func TestCircuitBreakerTrips(t *testing.T) {
 	}
 }
 
-func TestMicroCompactClearsCompactableToolResults(t *testing.T) {
-	c := New(Config{ContextWindow: 16000, MaxOutputTokens: 1000, KeepRecent: 1, ToolResultBudget: 100}, nil)
-	msgs := []llm.Message{
-		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "r1", Name: "Read", Input: []byte(`{}`)}}},
-		{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.ToolResultText("r1", strings.Repeat("y", 5000), false)}},
-		bigMsg(llm.RoleAssistant, 10), // recent, preserved
+// resultText returns the concatenated text of a tool_result block's content.
+func resultText(b llm.ContentBlock) string {
+	var s strings.Builder
+	for _, cb := range b.Content {
+		s.WriteString(cb.Text)
 	}
-	out := c.microCompact(msgs)
-	got := flatten(out[1].Content[0].Content)
-	if !strings.Contains(got, "cleared") {
-		t.Fatalf("compactable tool result not cleared: %q", got)
+	return s.String()
+}
+
+// readPair builds an assistant Read tool_use + its user tool_result.
+func toolPair(name, id, body string) []llm.Message {
+	return []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: id, Name: name, Input: []byte(`{}`)}}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.ToolResultText(id, body, false)}},
 	}
 }
 
-func TestMicroCompactSkipsNonCompactableTools(t *testing.T) {
-	c := New(Config{ContextWindow: 16000, MaxOutputTokens: 1000, KeepRecent: 1, ToolResultBudget: 100}, nil)
-	msgs := []llm.Message{
-		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "a1", Name: "Agent", Input: []byte(`{}`)}}},
-		{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.ToolResultText("a1", strings.Repeat("y", 5000), false)}},
-		bigMsg(llm.RoleAssistant, 10),
+// TestMicroCompactKeepsRecentClearsOld verifies the keep-last-N semantics: with
+// microKeepRecent (5) recent compactable results and older ones beyond that, only
+// the older results are cleared.
+func TestMicroCompactKeepsRecentClearsOld(t *testing.T) {
+	c := New(Config{ContextWindow: 16000, MaxOutputTokens: 1000}, nil)
+	var msgs []llm.Message
+	total := microKeepRecent + 2 // 2 older than the kept window
+	for i := 0; i < total; i++ {
+		msgs = append(msgs, toolPair("Read", "r"+strconv.Itoa(i), strings.Repeat("y", 500))...)
 	}
-	out := c.microCompact(msgs)
-	if strings.Contains(flatten(out[1].Content[0].Content), "cleared") {
+	out, changed := c.microCompact(msgs)
+	if !changed {
+		t.Fatal("microCompact should report a change")
+	}
+	// The first two Read results (oldest) must be cleared; the last five kept.
+	cleared := 0
+	for i, m := range out {
+		if len(m.Content) == 1 && m.Content[0].Type == llm.BlockToolResult {
+			if strings.Contains(resultText(m.Content[0]), "cleared") {
+				cleared++
+			} else if i < 2*2 { // one of the two oldest result messages
+				t.Fatalf("oldest result at %d should be cleared", i)
+			}
+		}
+	}
+	if cleared != 2 {
+		t.Fatalf("want 2 old results cleared, got %d", cleared)
+	}
+}
+
+// TestMicroCompactSkipsNonCompactableTools verifies non-compactable tool results
+// are never cleared, even when older than the kept window.
+func TestMicroCompactSkipsNonCompactableTools(t *testing.T) {
+	c := New(Config{ContextWindow: 16000, MaxOutputTokens: 1000}, nil)
+	var msgs []llm.Message
+	msgs = append(msgs, toolPair("Agent", "a0", strings.Repeat("y", 5000))...) // oldest, non-compactable
+	for i := 0; i < microKeepRecent+1; i++ {
+		msgs = append(msgs, toolPair("Read", "r"+strconv.Itoa(i), strings.Repeat("y", 500))...)
+	}
+	out, _ := c.microCompact(msgs)
+	if strings.Contains(resultText(out[1].Content[0]), "cleared") {
 		t.Fatal("Agent (non-compactable) result should NOT be cleared")
 	}
 }

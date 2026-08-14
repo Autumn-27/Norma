@@ -1,17 +1,23 @@
 // Package compaction keeps a conversation within a model's context window using
-// a graduated, non-destructive strategy:
+// three mechanisms aligned 1:1 with claude-code (see docs/COMPACTION-SPEC-3.md):
 //
-//   - L1 Snip            — drop the oldest working-set turns (last resort)
-//   - L2 MicroCompact    — clear stale COMPACTABLE tool-result bodies
-//   - L3 Context Collapse— fold old read/search spans and prose
-//   - L4 AutoCompact     — summarize the head behind a compact boundary
+//   - MicroCompact — clear stale COMPACTABLE tool-result bodies (non-destructive:
+//     the result can be re-read). Keeps the most recent N compactable results and
+//     clears the rest.
+//   - AutoCompact  — summarize the working head behind a compact boundary at the
+//     token threshold (or predictively). Non-destructive: the full history is
+//     retained in the message array; only messages after the last boundary are
+//     sent to the model (llm.MessagesForAPI).
+//   - Reactive     — on a prompt-too-long (413) error, force one AutoCompact and
+//     retry. It reuses AutoCompact; it is not a separate algorithm.
 //
-// Compaction is non-destructive: the full history is retained in the message
-// array and a boundary marker is inserted; only messages after the last
-// boundary are sent to the model (llm.MessagesForAPI). Thresholds are derived
+// Snip and Context-Collapse are intentionally absent: snip's removal decision can
+// only come from a model tool / user command (no automatic trigger), and
+// context-collapse is disabled by default in claude-code. Thresholds are derived
 // from the model's context window (minus a summary reservation and a buffer),
-// with a predictive pre-request check. Token counts use a real TokenCounter
-// when available, falling back to a 4/3-scaled length estimate.
+// with a predictive pre-request check. Token counts prefer the previous model
+// response's input_tokens and otherwise fall back to a 4/3-scaled per-block
+// length estimate.
 package compaction
 
 import (
@@ -30,17 +36,12 @@ type Summarizer func(ctx context.Context, msgs []llm.Message) (string, error)
 type Config struct {
 	// ContextWindow is the model's total context window in tokens (default 200000).
 	ContextWindow int
-	// MaxOutputTokens reserves room for the next turn / summary (default 8000).
+	// MaxOutputTokens is the model's max output capability; the summary reservation
+	// is min(MaxOutputTokens, 20000) (default 8000).
 	MaxOutputTokens int
-	// KeepRecent is the number of recent messages always kept in the API view.
+	// KeepRecent is the number of recent messages AutoCompact always preserves as
+	// the un-summarized tail (default 8). MicroCompact uses its own microKeepRecent.
 	KeepRecent int
-	// ToolResultBudget is the per-tool-result token size above which MicroCompact
-	// clears a stale result (default 1000).
-	ToolResultBudget int
-	// CompactTools are the tool names whose old exchanges Collapse folds.
-	CompactTools []string
-	// CountTokens, when set, gives exact token counts (e.g. llm.NewAnthropicTokenCounter).
-	CountTokens llm.TokenCounter
 }
 
 func (c *Config) defaults() {
@@ -53,48 +54,41 @@ func (c *Config) defaults() {
 	if c.KeepRecent == 0 {
 		c.KeepRecent = 8
 	}
-	if c.ToolResultBudget == 0 {
-		c.ToolResultBudget = 1000
-	}
-	if c.CompactTools == nil {
-		c.CompactTools = []string{"Read", "Grep", "Glob", "RecallMemory", "WebFetch", "WebSearch", "LS"}
-	}
 }
 
-// compactableTools — tools whose results MicroCompact may clear.
+// compactableTools — tools whose results MicroCompact may clear. Mirrors
+// claude-code COMPACTABLE_TOOLS (file read, shell, grep/glob, web, edit/write);
+// deliberately excludes LS/MultiEdit/NotebookEdit.
 var compactableTools = map[string]bool{
-	"Read": true, "Bash": true, "Grep": true, "Glob": true, "LS": true,
-	"WebFetch": true, "WebSearch": true, "Edit": true, "Write": true, "MultiEdit": true,
+	"Read": true, "Bash": true, "Grep": true, "Glob": true,
+	"WebFetch": true, "WebSearch": true, "Edit": true, "Write": true,
 }
 
 const (
-	microClearedMessage   = "[Old tool result content cleared]"
-	collapsedMessage      = "[read/search result collapsed to save context]"
-	toolResultGrowthGuess = 15000 // estimated per-turn tool-result token growth
-	maxAutoCompactFails   = 3
+	microClearedMessage   = "[Old tool result content cleared]" // == claude-code TIME_BASED_MC_CLEARED_MESSAGE
+	microKeepRecent       = 5                                   // == claude-code KEEP_RECENT (compactable results kept)
+	toolResultGrowthGuess = 15000                               // == claude-code TOOL_RESULT_GROWTH_ESTIMATE
+	maxAutoCompactFails   = 3                                   // == claude-code MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
 )
 
 // Compactor applies the strategy. Construct with New.
 type Compactor struct {
-	cfg         Config
-	summarize   Summarizer
-	collapseSet map[string]bool
-	failures    int
-	tripped     bool
+	cfg       Config
+	summarize Summarizer
+	failures  int
+	tripped   bool
 }
 
 // New builds a Compactor. summarize may be nil to disable AutoCompact.
 func New(cfg Config, summarize Summarizer) *Compactor {
 	cfg.defaults()
-	cs := make(map[string]bool, len(cfg.CompactTools))
-	for _, n := range cfg.CompactTools {
-		cs[n] = true
-	}
-	return &Compactor{cfg: cfg, summarize: summarize, collapseSet: cs}
+	return &Compactor{cfg: cfg, summarize: summarize}
 }
 
 // --- threshold math ---
 
+// reservedForSummary is min(model max output, 20000). MaxOutputTokens stands in
+// for the model's output capability; 0 (unset) reserves the full 20000.
 func (c *Compactor) reservedForSummary() int {
 	r := c.cfg.MaxOutputTokens
 	if r > 20000 || r == 0 {
@@ -103,95 +97,112 @@ func (c *Compactor) reservedForSummary() int {
 	return r
 }
 func (c *Compactor) effectiveWindow() int { return c.cfg.ContextWindow - c.reservedForSummary() }
+
+// buffer tiers off the EFFECTIVE window (== claude-code getAutocompactBufferTokens).
 func (c *Compactor) buffer() int {
-	switch {
-	case c.cfg.ContextWindow >= 800000:
+	switch ew := c.effectiveWindow(); {
+	case ew >= 800000:
 		return 50000
-	case c.cfg.ContextWindow >= 400000:
+	case ew >= 400000:
 		return 30000
 	default:
 		return 13000
 	}
 }
-func (c *Compactor) autoThreshold() int     { return c.effectiveWindow() - c.buffer() }
-func (c *Compactor) microThreshold() int    { return c.effectiveWindow() * 6 / 10 }
-func (c *Compactor) collapseThreshold() int { return c.effectiveWindow() * 7 / 10 }
-func (c *Compactor) maxTurnGrowth() int     { return c.cfg.MaxOutputTokens + toolResultGrowthGuess }
+func (c *Compactor) autoThreshold() int  { return c.effectiveWindow() - c.buffer() }
+func (c *Compactor) microThreshold() int { return c.effectiveWindow() * 6 / 10 }
+
+// maxTurnGrowth == claude-code estimateMaxTurnGrowth: min(maxOutput,20000)+15000.
+func (c *Compactor) maxTurnGrowth() int { return c.reservedForSummary() + toolResultGrowthGuess }
 func (c *Compactor) predictiveOver(tok int) bool {
 	return tok+c.maxTurnGrowth() > c.effectiveWindow()
 }
 
-// count returns the token count of the API view (post-boundary), using the real
-// counter when available and otherwise a 4/3-scaled length estimate.
-func (c *Compactor) count(ctx context.Context, msgs []llm.Message) int {
-	if c.cfg.CountTokens != nil {
-		if n, err := c.cfg.CountTokens(ctx, msgs); err == nil {
-			return n
-		}
+// count returns the token count of the API view (post-boundary). When
+// lastInputTokens > 0 (the total token size the previous model response
+// reported), it is preferred over local estimation — mirroring claude-code's
+// tokenCountWithEstimation. After a working-set mutation, callers pass 0 to force
+// a fresh per-block estimate.
+func (c *Compactor) count(msgs []llm.Message, lastInputTokens int) int {
+	if lastInputTokens > 0 {
+		return lastInputTokens
 	}
 	return EstimateTokens(llm.MessagesForAPI(msgs)) * 4 / 3
 }
 
-// EstimateTokens approximates the token footprint of messages (~4 chars/token).
+// EstimateTokens approximates the token footprint of messages (~4 chars/token),
+// counting each block by type (text, thinking text, tool_use name+input, and
+// nested tool_result content). Mirrors claude-code roughTokenCountEstimation
+// (without the 4/3 scale, which count applies).
 func EstimateTokens(msgs []llm.Message) int {
 	chars := 0
 	for _, m := range msgs {
 		for _, b := range m.Content {
-			chars += len(b.Text) + len(b.Input)
-			for _, cb := range b.Content {
-				chars += len(cb.Text)
-			}
+			chars += blockChars(b)
 		}
 	}
 	return chars / 4
 }
 
-// Pre conditions the history before a model request, applying the lightest
-// strategy that brings the API view under budget and escalating as needed. It
-// is non-destructive: AutoCompact inserts a boundary and retains prior history.
-func (c *Compactor) Pre(ctx context.Context, msgs []llm.Message) []llm.Message {
+// blockChars is the per-block character footprint. A Norma ContentBlock has no
+// image/document type; if one is added, its fixed 2000-token cost (claude-code
+// IMAGE_MAX_TOKEN_SIZE) would be added here.
+func blockChars(b llm.ContentBlock) int {
+	switch b.Type {
+	case llm.BlockText:
+		return len(b.Text)
+	case llm.BlockThinking:
+		return len(b.Thinking)
+	case llm.BlockToolUse:
+		return len(b.Name) + len(b.Input)
+	case llm.BlockToolResult:
+		n := 0
+		for _, cb := range b.Content {
+			n += blockChars(cb)
+		}
+		return n
+	default:
+		return len(b.Text)
+	}
+}
+
+// Pre conditions the history before a model request: MicroCompact to clear stale
+// tool results, then AutoCompact at the threshold (or predictively). Both are
+// non-destructive. lastInputTokens is the previous response's total token size
+// (0 if none yet), used as the initial gate count.
+func (c *Compactor) Pre(ctx context.Context, msgs []llm.Message, lastInputTokens int) []llm.Message {
 	if c.cfg.ContextWindow <= 0 {
 		return msgs
 	}
-	tok := c.count(ctx, msgs)
+	tok := c.count(msgs, lastInputTokens)
 	if tok <= c.microThreshold() {
 		return msgs
 	}
-	if tok > c.microThreshold() {
-		msgs = c.microCompact(msgs)
-		tok = c.count(ctx, msgs)
-	}
-	if tok > c.collapseThreshold() {
-		msgs = c.collapse(msgs)
-		tok = c.count(ctx, msgs)
+	// MicroCompact: clear old COMPACTABLE tool results (non-destructive). Only
+	// re-estimate when it actually changed the array; otherwise the gate count
+	// (which prefers the accurate last-response size) still holds.
+	if out, changed := c.microCompact(msgs); changed {
+		msgs = out
+		tok = c.count(msgs, 0)
 	}
 	// AutoCompact: at the threshold, or predictively if the next turn would overflow.
 	if tok >= c.autoThreshold() || c.predictiveOver(tok) {
 		if out, ok := c.autoCompact(ctx, msgs, tok, "auto"); ok {
 			msgs = out
-			tok = c.count(ctx, msgs)
 		}
-	}
-	// Snip is the last resort if summarization couldn't run (e.g. breaker tripped).
-	if tok >= c.autoThreshold() {
-		msgs = c.snip(msgs)
 	}
 	return msgs
 }
 
-// Reactive force-compacts after a prompt-too-long error: collapse (drain) →
-// AutoCompact → snip, cheapest first.
+// Reactive force-compacts after a prompt-too-long error by running one
+// AutoCompact (mirrors claude-code tryReactiveCompact, which only summarizes —
+// no micro/collapse/snip cascade). Returns whether the API view shrank.
 func (c *Compactor) Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Message, bool) {
-	before := c.count(ctx, msgs)
-	msgs = c.microCompact(msgs)
-	msgs = c.collapse(msgs)
-	if c.count(ctx, msgs) >= before {
-		if out, ok := c.autoCompact(ctx, msgs, before, "reactive"); ok {
-			msgs = out
-		}
+	before := c.count(msgs, 0)
+	if out, ok := c.autoCompact(ctx, msgs, before, "reactive"); ok {
+		return out, c.count(out, 0) < before
 	}
-	msgs = c.snip(msgs)
-	return msgs, c.count(ctx, msgs) < before
+	return msgs, false
 }
 
 // IsOverflow is the method form (satisfies the harness Compactor interface).
@@ -212,13 +223,10 @@ func IsOverflow(err error) bool {
 
 // workingBounds returns [start, tailStart): start is just after the last
 // boundary marker (0 if none); tailStart is where the preserved recent tail
-// begins. Messages in [start, tailStart) are eligible for clearing/summary.
+// begins. Messages in [start, tailStart) are eligible for summary.
 func (c *Compactor) workingBounds(msgs []llm.Message) (start, tailStart int) {
 	start = llm.LastBoundaryIndex(msgs) + 1
-	tailStart = lastNNonMarkerStart(msgs, c.cfg.KeepRecent)
-	if tailStart < start {
-		tailStart = start
-	}
+	tailStart = max(lastNNonMarkerStart(msgs, c.cfg.KeepRecent), start)
 	return
 }
 
@@ -233,70 +241,56 @@ func lastNNonMarkerStart(msgs []llm.Message, keep int) int {
 	return i
 }
 
-func toolNameMap(msgs []llm.Message) map[string]string {
-	m := map[string]string{}
-	for _, msg := range msgs {
-		for _, b := range msg.Content {
-			if b.Type == llm.BlockToolUse {
-				m[b.ID] = b.Name
+// --- MicroCompact: keep the most recent N compactable results, clear the rest ---
+
+// microCompact clears the bodies of all COMPACTABLE tool results except the most
+// recent microKeepRecent, returning the (possibly new) message slice and whether
+// anything changed. It is non-destructive: a cleared result can be re-read.
+func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
+	// Collect compactable tool_use ids in encounter order.
+	var ids []string
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == llm.BlockToolUse && compactableTools[b.Name] {
+				ids = append(ids, b.ID)
 			}
 		}
 	}
-	return m
-}
-
-// --- L2 MicroCompact: clear COMPACTABLE tool results in the working head ---
-
-func (c *Compactor) microCompact(msgs []llm.Message) []llm.Message {
-	start, tailStart := c.workingBounds(msgs)
-	if tailStart <= start {
-		return msgs
+	if len(ids) <= microKeepRecent {
+		return msgs, false // nothing old enough to clear
 	}
-	names := toolNameMap(msgs)
+	clearSet := make(map[string]bool, len(ids)-microKeepRecent)
+	for _, id := range ids[:len(ids)-microKeepRecent] {
+		clearSet[id] = true
+	}
+	changed := false
 	out := append([]llm.Message(nil), msgs...)
-	for i := start; i < tailStart; i++ {
-		nc := append([]llm.ContentBlock(nil), out[i].Content...)
-		for j, b := range nc {
-			if b.Type == llm.BlockToolResult && compactableTools[names[b.ToolUseID]] {
-				if estTokens(flatten(b.Content)) > c.cfg.ToolResultBudget {
-					nc[j].Content = []llm.ContentBlock{llm.TextBlock(microClearedMessage)}
+	for i := range out {
+		var nc []llm.ContentBlock
+		for j, b := range out[i].Content {
+			if b.Type == llm.BlockToolResult && clearSet[b.ToolUseID] && !isCleared(b.Content) {
+				if nc == nil {
+					nc = append([]llm.ContentBlock(nil), out[i].Content...)
 				}
+				nc[j].Content = []llm.ContentBlock{llm.TextBlock(microClearedMessage)}
+				changed = true
 			}
 		}
-		out[i].Content = nc
-	}
-	return out
-}
-
-// --- L3 Context Collapse: fold read/search results + truncate prose ---
-
-func (c *Compactor) collapse(msgs []llm.Message) []llm.Message {
-	start, tailStart := c.workingBounds(msgs)
-	if tailStart <= start {
-		return msgs
-	}
-	names := toolNameMap(msgs)
-	out := append([]llm.Message(nil), msgs...)
-	for i := start; i < tailStart; i++ {
-		nc := append([]llm.ContentBlock(nil), out[i].Content...)
-		for j, b := range nc {
-			switch b.Type {
-			case llm.BlockText, llm.BlockThinking:
-				if r := []rune(b.Text); len(r) > 200 {
-					nc[j].Text = string(r[:200]) + " …[collapsed]"
-				}
-			case llm.BlockToolResult:
-				if c.collapseSet[names[b.ToolUseID]] {
-					nc[j].Content = []llm.ContentBlock{llm.TextBlock(collapsedMessage)}
-				}
-			}
+		if nc != nil {
+			out[i].Content = nc
 		}
-		out[i].Content = nc
 	}
-	return out
+	if !changed {
+		return msgs, false
+	}
+	return out, true
 }
 
-// --- L4 AutoCompact: non-destructive boundary + summary ---
+func isCleared(blocks []llm.ContentBlock) bool {
+	return len(blocks) == 1 && blocks[0].Type == llm.BlockText && blocks[0].Text == microClearedMessage
+}
+
+// --- AutoCompact: non-destructive boundary + summary ---
 
 func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok int, trigger string) ([]llm.Message, bool) {
 	if c.summarize == nil || c.tripped {
@@ -332,7 +326,7 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 		ActiveSkills:       skillNames(reinjected),
 	})
 	summaryMsg := llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{
-		llm.TextBlock("[conversation summarized to save context]\n\n" + summary),
+		llm.TextBlock(compactContinuationPreamble + summary),
 	}}
 	// Retain everything before tailStart (non-destructive); insert the new
 	// boundary + summary (+ re-injected skills) just before the preserved recent tail.
@@ -343,6 +337,11 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 	out = append(out, msgs[tailStart:]...)
 	return out, true
 }
+
+// compactContinuationPreamble prefixes the inserted summary message, mirroring
+// claude-code getCompactUserSummaryMessage. formatCompactSummary already prefixes
+// the digest with "Summary:\n".
+const compactContinuationPreamble = "This session is being continued from a previous conversation that ran out of context. The conversation is summarized below:\n\n"
 
 // Skill re-injection budget: per-skill and total token caps for verbatim skill
 // instructions re-surfaced after a compaction boundary (mirrors claude-code's
@@ -421,21 +420,6 @@ func reinjectSkills(msgs []llm.Message, tailStart int) []llm.Message {
 	return out
 }
 
-// --- L1 Snip: drop oldest working-set messages (last resort) ---
-
-func (c *Compactor) snip(msgs []llm.Message) []llm.Message {
-	target := c.autoThreshold()
-	for EstimateTokens(llm.MessagesForAPI(msgs))*4/3 > target {
-		start, tailStart := c.workingBounds(msgs)
-		if tailStart <= start {
-			return msgs
-		}
-		// remove the oldest working-set message
-		msgs = append(msgs[:start:start], msgs[start+1:]...)
-	}
-	return msgs
-}
-
 func contentOnly(msgs []llm.Message) []llm.Message {
 	out := make([]llm.Message, 0, len(msgs))
 	for _, m := range msgs {
@@ -445,13 +429,3 @@ func contentOnly(msgs []llm.Message) []llm.Message {
 	}
 	return out
 }
-
-func flatten(blocks []llm.ContentBlock) string {
-	var s strings.Builder
-	for _, b := range blocks {
-		s.WriteString(b.Text)
-	}
-	return s.String()
-}
-
-func estTokens(s string) int { return len(s) / 4 }

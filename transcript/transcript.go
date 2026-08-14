@@ -13,7 +13,7 @@
 // replaying raw history and re-summarizing. The kept tail
 // is re-recorded after the boundary (it also exists earlier as births); only the
 // post-boundary copy reaches the model. Lightweight working-set edits that do not
-// add a boundary (collapse/snip/micro tool-result clearing) stay ephemeral and
+// add a boundary (MicroCompact tool-result clearing) stay ephemeral and
 // are not persisted. A separate Type=="boundary" record is written for
 // observability and is skipped during reconstruction.
 package transcript

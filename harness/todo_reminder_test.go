@@ -22,11 +22,11 @@ func todoWriteAsst() llm.Message {
 func TestTodoReminderTurnCounts(t *testing.T) {
 	msgs := []llm.Message{
 		llm.UserText("go"),
-		todoWriteAsst(),                                  // the write turn — not counted
+		todoWriteAsst(), // the write turn — not counted
 		{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.ToolResultText("t1", "ok", false)}},
-		asst("thinking about it"),                        // +1 since write
+		asst("thinking about it"), // +1 since write
 		llm.UserText("more"),
-		asst("still working"),                            // +1 since write
+		asst("still working"), // +1 since write
 	}
 	sinceWrite, sinceReminder := todoReminderTurnCounts(msgs)
 	if sinceWrite != 2 {

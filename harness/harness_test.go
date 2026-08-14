@@ -151,7 +151,7 @@ func TestParallelReadOnlyExecution(t *testing.T) {
 // [boundary, summary, tail] — the shape recordNewBoundary must persist.
 type fakeCompactor struct{ done bool }
 
-func (f *fakeCompactor) Pre(_ context.Context, msgs []llm.Message) []llm.Message {
+func (f *fakeCompactor) Pre(_ context.Context, msgs []llm.Message, _ int) []llm.Message {
 	if f.done || len(msgs) < 2 {
 		return msgs
 	}

@@ -224,7 +224,7 @@ func NewSession(opts Options) *Session {
 	}
 	s := &Session{opts: opts}
 	if opts.Compaction != nil {
-		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(opts.Provider))
+		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens))
 	}
 	if opts.Plan != nil {
 		start := opts.PermissionMode

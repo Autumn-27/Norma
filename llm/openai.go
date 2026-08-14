@@ -134,8 +134,13 @@ func (p *openaiProvider) buildBody(req CompletionRequest) ([]byte, error) {
 		Stream:      true,
 	}
 	body.StreamOptions.IncludeUsage = true
-	if p.cfg.ThinkingType != "" {
-		body.Thinking = &oaThinking{Type: p.cfg.ThinkingType}
+	// A non-empty per-request override (req.Thinking) wins over Config.ThinkingType.
+	thinkingType := p.cfg.ThinkingType
+	if req.Thinking != "" {
+		thinkingType = req.Thinking
+	}
+	if thinkingType != "" {
+		body.Thinking = &oaThinking{Type: thinkingType}
 	}
 	body.ReasoningEffort = p.cfg.ReasoningEffort // omitempty drops it when unset
 	for _, t := range req.Tools {
