@@ -199,10 +199,12 @@ func TestToOpenAIMessagesThreadsToolResults(t *testing.T) {
 	}
 }
 
-// A thinking-only (or empty) assistant turn must not serialize to a bare
-// {"role":"assistant"} message — OpenAI rejects that with 400 "content or
-// tool_calls must be set". It should be skipped entirely.
-func TestToOpenAIMessagesSkipsEmptyAssistant(t *testing.T) {
+// A thinking-only assistant turn is kept (not dropped) with a placeholder
+// content and its reasoning_content passed back: DeepSeek-style thinking mode
+// requires the reasoning to be echoed, and keeping the turn preserves
+// user/assistant alternation for gateways that enforce it. A bare
+// {"role":"assistant"} would 400 with "content or tool_calls must be set".
+func TestToOpenAIMessagesKeepsThinkingOnlyAssistant(t *testing.T) {
 	msgs := []Message{
 		UserText("hi"),
 		{Role: RoleAssistant, Content: []ContentBlock{
@@ -211,14 +213,37 @@ func TestToOpenAIMessagesSkipsEmptyAssistant(t *testing.T) {
 		UserText("still there?"),
 	}
 	oa := toOpenAIMessages("", msgs)
-	for _, m := range oa {
-		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
-			t.Fatalf("emitted empty assistant message: %+v", oa)
-		}
+	// All three turns survive (the assistant is kept, not dropped).
+	if len(oa) != 3 || oa[1].Role != "assistant" {
+		t.Fatalf("want 3 messages with assistant kept, got %d: %+v", len(oa), oa)
 	}
-	// The two user turns survive; the empty assistant is dropped.
-	if len(oa) != 2 {
-		t.Fatalf("want 2 messages, got %d: %+v", len(oa), oa)
+	if oa[1].Content == "" && len(oa[1].ToolCalls) == 0 {
+		t.Fatalf("assistant must carry content or tool_calls: %+v", oa[1])
+	}
+	// The reasoning must be passed back verbatim (from b.Thinking, not b.Text).
+	if oa[1].ReasoningContent != "pondering, no answer emitted" {
+		t.Fatalf("reasoning_content not passed back: %+v", oa[1])
+	}
+}
+
+// A multi-turn assistant turn with BOTH text and thinking must serialize the
+// text as content and the thinking as reasoning_content (the DeepSeek-thinking
+// multi-turn 400 this fixes).
+func TestToOpenAIMessagesPassesReasoningWithText(t *testing.T) {
+	msgs := []Message{
+		UserText("q"),
+		{Role: RoleAssistant, Content: []ContentBlock{
+			{Type: BlockThinking, Thinking: "reasoning trace"},
+			{Type: BlockText, Text: "the answer"},
+		}},
+		UserText("next"),
+	}
+	oa := toOpenAIMessages("", msgs)
+	if oa[1].Role != "assistant" || oa[1].Content != "the answer" {
+		t.Fatalf("content wrong: %+v", oa[1])
+	}
+	if oa[1].ReasoningContent != "reasoning trace" {
+		t.Fatalf("reasoning_content wrong: %+v", oa[1])
 	}
 }
 

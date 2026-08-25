@@ -13,10 +13,11 @@ import (
 type openaiProvider struct{ cfg Config }
 
 type oaMessage struct {
-	Role       string       `json:"role"`
-	Content    string       `json:"content,omitempty"`
-	ToolCalls  []oaToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string       `json:"tool_call_id,omitempty"`
+	Role             string       `json:"role"`
+	Content          string       `json:"content,omitempty"`
+	ReasoningContent string       `json:"reasoning_content,omitempty"`
+	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string       `json:"tool_call_id,omitempty"`
 }
 
 type oaToolCall struct {
@@ -72,10 +73,17 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 		case RoleAssistant:
 			om := oaMessage{Role: "assistant"}
 			var text strings.Builder
+			var reasoning strings.Builder
 			for _, b := range m.Content {
 				switch b.Type {
 				case BlockText:
 					text.WriteString(b.Text)
+				case BlockThinking:
+					// DeepSeek-style thinking mode requires the previous turn's
+					// reasoning_content to be passed back verbatim; dropping it
+					// makes the API reject the request with a 400. Thinking text
+					// lives in b.Thinking (not b.Text) — see ContentBlock.
+					reasoning.WriteString(b.Thinking)
 				case BlockToolUse:
 					tc := oaToolCall{ID: b.ID, Type: "function"}
 					tc.Function.Name = b.Name
@@ -87,14 +95,20 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 				}
 			}
 			om.Content = text.String()
-			// OpenAI requires an assistant message to carry content or
-			// tool_calls. A turn that produced only thinking (reasoning), or
-			// an empty/truncated turn, has neither once thinking is stripped
-			// here — and Content's omitempty would drop an empty string, so
-			// the message would serialize to {"role":"assistant"} and the API
-			// rejects it with 400 "content or tool_calls must be set". Skip it.
+			if s := reasoning.String(); s != "" {
+				om.ReasoningContent = s
+			}
+			// OpenAI requires every assistant message to carry content or
+			// tool_calls; Content's omitempty would otherwise serialize a
+			// content-less turn to a bare {"role":"assistant"} and the API 400s
+			// with "content or tool_calls must be set". Rather than drop such a
+			// turn, keep it with a minimal placeholder: a thinking-only turn must
+			// stay so its reasoning_content is passed back (DeepSeek-style
+			// thinking mode requires it), and keeping the assistant turn also
+			// preserves user/assistant alternation for gateways that enforce it
+			// (dropping it would leave two adjacent user messages).
 			if om.Content == "" && len(om.ToolCalls) == 0 {
-				continue
+				om.Content = "…"
 			}
 			out = append(out, om)
 		case RoleUser:
