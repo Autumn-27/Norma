@@ -41,6 +41,9 @@ type Format string
 const (
 	FormatAnthropic Format = "anthropic"
 	FormatOpenAI    Format = "openai"
+	// FormatOpenAIResponses speaks the OpenAI Responses API (POST /v1/responses),
+	// distinct from FormatOpenAI's Chat Completions (/chat/completions).
+	FormatOpenAIResponses Format = "openai-responses"
 )
 
 // Config configures the built-in providers (FR-03.4).
@@ -134,8 +137,16 @@ func NewProvider(cfg Config) (Provider, error) {
 			cfg.BaseURL = envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")
 		}
 		return &openaiProvider{cfg: cfg}, nil
+	case FormatOpenAIResponses:
+		if cfg.APIKey == "" {
+			cfg.APIKey = os.Getenv("OPENAI_API_KEY")
+		}
+		if cfg.BaseURL == "" {
+			cfg.BaseURL = envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")
+		}
+		return &openaiResponsesProvider{cfg: cfg}, nil
 	default:
-		return nil, fmt.Errorf("llm: unknown format %q (use anthropic or openai)", cfg.Format)
+		return nil, fmt.Errorf("llm: unknown format %q (use anthropic, openai or openai-responses)", cfg.Format)
 	}
 }
 
