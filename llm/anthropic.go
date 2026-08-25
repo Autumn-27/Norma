@@ -47,7 +47,7 @@ type anthropicTool struct {
 	InputSchema map[string]any `json:"input_schema"`
 }
 
-func (p *anthropicProvider) buildBody(req CompletionRequest) ([]byte, error) {
+func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
 	maxTok := req.MaxTokens
 	if maxTok == 0 {
 		maxTok = 8192
@@ -68,7 +68,7 @@ func (p *anthropicProvider) buildBody(req CompletionRequest) ([]byte, error) {
 		MaxTokens:     maxTok,
 		Temperature:   req.Temperature,
 		StopSequences: req.Stop,
-		Stream:        true,
+		Stream:        stream,
 		System:        buildAnthropicSystem(req),
 	}
 	for _, t := range req.Tools {
@@ -107,7 +107,7 @@ func buildAnthropicSystem(req CompletionRequest) []anthropicSystemBlock {
 
 func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) iter.Seq2[StreamEvent, error] {
 	return func(yield func(StreamEvent, error) bool) {
-		body, err := p.buildBody(req)
+		body, err := p.buildBody(req, true)
 		if err != nil {
 			yield(StreamEvent{}, err)
 			return
@@ -149,6 +149,87 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 			}
 		}
 	}
+}
+
+// Complete performs a real non-streaming completion: it sends stream:false and
+// parses the single JSON response from /v1/messages into a full assistant
+// Message, returning it with the stop reason and normalized usage.
+func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest) (Message, string, Usage, error) {
+	body, err := p.buildBody(req, false)
+	if err != nil {
+		return Message{}, "", Usage{}, err
+	}
+	resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/v1/messages", body, func(r *http.Request) {
+		r.Header.Set("content-type", "application/json")
+		r.Header.Set("x-api-key", p.cfg.APIKey)
+		r.Header.Set("anthropic-version", p.cfg.APIVersion)
+		r.Header.Set("accept", "application/json")
+	}, "anthropic")
+	if err != nil {
+		return Message{}, "", Usage{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Message{}, "", Usage{}, err
+	}
+	return parseAnthropicResponse(raw)
+}
+
+// parseAnthropicResponse decodes a non-streaming Messages API response into the
+// neutral Message model. Anthropic already speaks the content-block shape, so
+// text/thinking/tool_use blocks map across directly.
+func parseAnthropicResponse(raw []byte) (Message, string, Usage, error) {
+	var r struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type      string          `json:"type"`
+			Text      string          `json:"text"`
+			Thinking  string          `json:"thinking"`
+			Signature string          `json:"signature"`
+			ID        string          `json:"id"`
+			Name      string          `json:"name"`
+			Input     json.RawMessage `json:"input"`
+		} `json:"content"`
+		StopReason string          `json:"stop_reason"`
+		Usage      *anthropicUsage `json:"usage"`
+		Error      *struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return Message{}, "", Usage{}, fmt.Errorf("anthropic: decode response: %w (body: %s)", err, truncate(string(raw), 500))
+	}
+	if r.Error != nil || r.Type == "error" {
+		msg := "error response"
+		if r.Error != nil {
+			msg = r.Error.Message
+		}
+		return Message{}, "", Usage{}, fmt.Errorf("anthropic: %s", msg)
+	}
+	var usage Usage
+	if r.Usage != nil {
+		usage = r.Usage.norm()
+	}
+	var blocks []ContentBlock
+	for _, b := range r.Content {
+		switch b.Type {
+		case "text":
+			if b.Text != "" {
+				blocks = append(blocks, TextBlock(b.Text))
+			}
+		case "thinking":
+			blocks = append(blocks, ContentBlock{Type: BlockThinking, Thinking: b.Thinking, Signature: b.Signature})
+		case "tool_use":
+			in := b.Input
+			if len(in) == 0 {
+				in = json.RawMessage("{}")
+			}
+			blocks = append(blocks, ContentBlock{Type: BlockToolUse, ID: b.ID, Name: b.Name, Input: in})
+		}
+	}
+	return Message{Role: RoleAssistant, Content: blocks}, r.StopReason, usage, nil
 }
 
 func parseAnthropicFrame(data string) (StreamEvent, bool, error) {

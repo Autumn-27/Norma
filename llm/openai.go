@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"iter"
 	"net/http"
@@ -42,18 +43,20 @@ type oaThinking struct {
 }
 
 type oaReq struct {
-	Model           string      `json:"model"`
-	Messages        []oaMessage `json:"messages"`
-	Tools           []oaTool    `json:"tools,omitempty"`
-	MaxTokens       int         `json:"max_tokens,omitempty"`
-	Temperature     *float64    `json:"temperature,omitempty"`
-	Stop            []string    `json:"stop,omitempty"`
-	Thinking        *oaThinking `json:"thinking,omitempty"`
-	ReasoningEffort string      `json:"reasoning_effort,omitempty"`
-	Stream          bool        `json:"stream"`
-	StreamOptions   struct {
-		IncludeUsage bool `json:"include_usage"`
-	} `json:"stream_options"`
+	Model           string        `json:"model"`
+	Messages        []oaMessage   `json:"messages"`
+	Tools           []oaTool      `json:"tools,omitempty"`
+	MaxTokens       int           `json:"max_tokens,omitempty"`
+	Temperature     *float64      `json:"temperature,omitempty"`
+	Stop            []string      `json:"stop,omitempty"`
+	Thinking        *oaThinking   `json:"thinking,omitempty"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
+	Stream          bool          `json:"stream"`
+	StreamOptions   *oaStreamOpts `json:"stream_options,omitempty"`
+}
+
+type oaStreamOpts struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // toOpenAIMessages flattens the unified model into OpenAI's role-based format:
@@ -124,16 +127,20 @@ func flattenText(blocks []ContentBlock) string {
 	return s.String()
 }
 
-func (p *openaiProvider) buildBody(req CompletionRequest) ([]byte, error) {
+func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
 	body := oaReq{
 		Model:       p.cfg.Model,
 		Messages:    toOpenAIMessages(joinSystem(req.System), req.Messages),
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		Stop:        req.Stop,
-		Stream:      true,
+		Stream:      stream,
 	}
-	body.StreamOptions.IncludeUsage = true
+	// stream_options.include_usage is a streaming-only field; some gateways reject
+	// it on a non-streaming request, so send it only when streaming.
+	if stream {
+		body.StreamOptions = &oaStreamOpts{IncludeUsage: true}
+	}
 	// A non-empty per-request override (req.Thinking) wins over Config.ThinkingType.
 	thinkingType := p.cfg.ThinkingType
 	if req.Thinking != "" {
@@ -156,7 +163,7 @@ func (p *openaiProvider) buildBody(req CompletionRequest) ([]byte, error) {
 
 func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter.Seq2[StreamEvent, error] {
 	return func(yield func(StreamEvent, error) bool) {
-		body, err := p.buildBody(req)
+		body, err := p.buildBody(req, true)
 		if err != nil {
 			yield(StreamEvent{}, err)
 			return
@@ -212,6 +219,100 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			}
 		}
 	}
+}
+
+// Complete performs a real non-streaming completion: it sends stream:false and
+// parses the single JSON response body into a full assistant Message. It returns
+// the assembled message, the normalized stop reason, and token usage. A 200
+// response whose body is an error object (some gateways do this instead of a 4xx)
+// is surfaced as an error rather than an empty completion.
+func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (Message, string, Usage, error) {
+	body, err := p.buildBody(req, false)
+	if err != nil {
+		return Message{}, "", Usage{}, err
+	}
+	resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
+		r.Header.Set("content-type", "application/json")
+		r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
+		r.Header.Set("accept", "application/json")
+	}, "openai")
+	if err != nil {
+		return Message{}, "", Usage{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Message{}, "", Usage{}, err
+	}
+	return parseOpenAIResponse(raw)
+}
+
+// parseOpenAIResponse decodes a non-streaming Chat Completions response body into
+// the neutral Message model. reasoning_content (a reasoning model's thinking) is
+// mapped to a thinking block; content to a text block; tool_calls to tool_use
+// blocks — the same shape the streaming path accumulates.
+func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
+	var r struct {
+		Choices []struct {
+			Message struct {
+				Content          string       `json:"content"`
+				ReasoningContent string       `json:"reasoning_content"`
+				ToolCalls        []oaToolCall `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *struct {
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return Message{}, "", Usage{}, fmt.Errorf("openai: decode response: %w (body: %s)", err, truncate(string(raw), 500))
+	}
+	if r.Error != nil {
+		return Message{}, "", Usage{}, fmt.Errorf("openai: %s", r.Error.Message)
+	}
+	var usage Usage
+	if r.Usage != nil {
+		usage = Usage{
+			InputTokens:     r.Usage.PromptTokens,
+			OutputTokens:    r.Usage.CompletionTokens,
+			CacheReadTokens: r.Usage.PromptTokensDetails.CachedTokens,
+		}
+	}
+	if len(r.Choices) == 0 {
+		return Message{}, "", usage, fmt.Errorf("openai: empty response (no choices; body: %s)", truncate(string(raw), 500))
+	}
+	ch := r.Choices[0]
+	var blocks []ContentBlock
+	if ch.Message.ReasoningContent != "" {
+		blocks = append(blocks, ContentBlock{Type: BlockThinking, Thinking: ch.Message.ReasoningContent})
+	}
+	if ch.Message.Content != "" {
+		blocks = append(blocks, TextBlock(ch.Message.Content))
+	}
+	for _, tc := range ch.Message.ToolCalls {
+		in := tc.Function.Arguments
+		if strings.TrimSpace(in) == "" {
+			in = "{}"
+		}
+		blocks = append(blocks, ContentBlock{Type: BlockToolUse, ID: tc.ID, Name: tc.Function.Name, Input: []byte(in)})
+	}
+	return Message{Role: RoleAssistant, Content: blocks}, mapOpenAIFinish(ch.FinishReason), usage, nil
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, stopReason string, usage Usage, hasUsage bool) {

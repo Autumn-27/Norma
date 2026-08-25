@@ -29,6 +29,23 @@ func (p *echoProvider) Stream(_ context.Context, req llm.CompletionRequest) iter
 	}
 }
 
+func (p *echoProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	return accumulateStream(ctx, p, req)
+}
+
+// accumulateStream drains a provider's own Stream to satisfy the non-streaming
+// Complete method for test mocks.
+func accumulateStream(ctx context.Context, p llm.Provider, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	acc := llm.NewAccumulator()
+	for ev, err := range p.Stream(ctx, req) {
+		if err != nil {
+			return llm.Message{}, "", llm.Usage{}, err
+		}
+		acc.Add(ev)
+	}
+	return acc.Message(), acc.StopReason, acc.Usage, nil
+}
+
 func TestRunParallelFansOut(t *testing.T) {
 	prov := &echoProvider{}
 	c := &Config{

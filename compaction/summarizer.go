@@ -27,7 +27,7 @@ const summarySystemPrompt = "You are a helpful AI assistant tasked with summariz
 // min(20000, maxOutputTokens). It retries transient stream failures
 // (MAX_COMPACT_STREAMING_RETRIES) and, if the summary request itself overflows,
 // drops the oldest API-round groups and retries (MAX_PTL_RETRIES).
-func ProviderSummarizer(p llm.Provider, maxOutputTokens int) Summarizer {
+func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) Summarizer {
 	maxOut := compactMaxOutputTokens
 	if maxOutputTokens > 0 && maxOutputTokens < maxOut {
 		maxOut = maxOutputTokens
@@ -36,7 +36,7 @@ func ProviderSummarizer(p llm.Provider, maxOutputTokens int) Summarizer {
 		work := pairForReplay(msgs)
 		var lastErr error
 		for attempt := 0; attempt <= maxPTLRetries; attempt++ {
-			raw, err := streamSummary(ctx, p, maxOut, work)
+			raw, err := streamSummary(ctx, p, maxOut, work, nonStreaming)
 			if err == nil {
 				return formatCompactSummary(raw), nil
 			}
@@ -57,7 +57,7 @@ func ProviderSummarizer(p llm.Provider, maxOutputTokens int) Summarizer {
 // streamSummary issues one summary request (head + summary-request message),
 // retrying transient (non-overflow) stream failures. Overflow is returned
 // immediately so the caller can truncate and retry at a coarser granularity.
-func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message) (string, error) {
+func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, nonStreaming bool) (string, error) {
 	reqMsgs := make([]llm.Message, 0, len(head)+1)
 	reqMsgs = append(reqMsgs, head...)
 	reqMsgs = append(reqMsgs, llm.UserText(compactPrompt))
@@ -72,22 +72,31 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		acc := llm.NewAccumulator()
-		var streamErr error
-		for ev, err := range p.Stream(ctx, req) {
-			if err != nil {
-				streamErr = err
-				break
+		var text string
+		var callErr error
+		if nonStreaming {
+			msg, _, _, err := p.Complete(ctx, req)
+			text, callErr = msg.Text(), err
+		} else {
+			acc := llm.NewAccumulator()
+			for ev, err := range p.Stream(ctx, req) {
+				if err != nil {
+					callErr = err
+					break
+				}
+				acc.Add(ev)
 			}
-			acc.Add(ev)
+			if callErr == nil {
+				text = acc.Message().Text()
+			}
 		}
-		if streamErr == nil {
-			return acc.Message().Text(), nil
+		if callErr == nil {
+			return text, nil
 		}
-		if IsOverflow(streamErr) {
-			return "", streamErr // PTL — let the caller truncate, don't burn streaming retries
+		if IsOverflow(callErr) {
+			return "", callErr // PTL — let the caller truncate, don't burn streaming retries
 		}
-		lastErr = streamErr // transient — retry
+		lastErr = callErr // transient — retry
 	}
 	return "", lastErr
 }

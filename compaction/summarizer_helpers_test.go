@@ -159,7 +159,7 @@ func TestProviderSummarizerMaxOutCap(t *testing.T) {
 	}
 	for _, tc := range cases {
 		p := &captureProvider{reply: "<summary>x</summary>"}
-		_, _ = ProviderSummarizer(p, tc.mo)(context.Background(), []llm.Message{llm.UserText("hi")})
+		_, _ = ProviderSummarizer(p, tc.mo, false)(context.Background(), []llm.Message{llm.UserText("hi")})
 		if p.reqs[0].MaxTokens != tc.want {
 			t.Errorf("mo=%d: MaxTokens=%d, want %d", tc.mo, p.reqs[0].MaxTokens, tc.want)
 		}
@@ -172,7 +172,7 @@ func TestSummarizerContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	p := &captureProvider{reply: "x"}
-	_, err := ProviderSummarizer(p, 0)(ctx, []llm.Message{llm.UserText("hi")})
+	_, err := ProviderSummarizer(p, 0, false)(ctx, []llm.Message{llm.UserText("hi")})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
 	}
@@ -184,7 +184,7 @@ func TestSummarizerContextCancelled(t *testing.T) {
 func TestSummarizerPTLExhausts(t *testing.T) {
 	p := &captureProvider{failN: 999} // every attempt overflows
 	head := []llm.Message{llm.UserText("u0"), asstText("a1"), llm.UserText("u1"), asstText("a2")}
-	_, err := ProviderSummarizer(p, 0)(context.Background(), head)
+	_, err := ProviderSummarizer(p, 0, false)(context.Background(), head)
 	if err == nil || !IsOverflow(err) {
 		t.Fatalf("persistent overflow should surface an overflow error, got %v", err)
 	}

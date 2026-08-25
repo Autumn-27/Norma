@@ -37,8 +37,14 @@ type QueryInput struct {
 	MaxTurns       int
 	MaxDuration    time.Duration
 	MaxConcurrency int
-	WorkingDir     string
-	AgentID        string
+	// NonStreaming makes each model call a single non-streaming request (via
+	// QueryDeps.CallModelSync / Provider.Complete) instead of a token stream. The
+	// loop still emits the same KindText/KindThinking/KindToolUse/KindUsage events
+	// to the host — they are surfaced once, when the full response arrives, rather
+	// than incrementally. Zero value = streaming (unchanged default).
+	NonStreaming bool
+	WorkingDir   string
+	AgentID      string
 	// ToolOutputDir, when set, makes oversized tool output spill to a file there
 	// (full content kept) instead of being discarded; MaxToolOutputChars sets the
 	// per-tool output budget (head size; 0 = default 30000). See tool.Capture.
@@ -157,12 +163,19 @@ type HookRunner interface {
 // QueryDeps are injectable side-effect boundaries for testing (FR-01.6).
 type QueryDeps struct {
 	CallModel func(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error]
-	NewID     func() string
+	// CallModelSync is the non-streaming counterpart of CallModel, used when
+	// QueryInput.NonStreaming is set. It performs a single request and returns the
+	// fully assembled assistant message, the stop reason, and cumulative usage.
+	CallModelSync func(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error)
+	NewID         func() string
 }
 
 func (d *QueryDeps) withDefaults(in QueryInput) {
-	if d.CallModel == nil {
+	if d.CallModel == nil && in.Provider != nil {
 		d.CallModel = in.Provider.Stream
+	}
+	if d.CallModelSync == nil && in.Provider != nil {
+		d.CallModelSync = in.Provider.Complete
 	}
 	if d.NewID == nil {
 		var n int64
@@ -718,6 +731,9 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		MaxTokens:       l.maxTokens(),
 		Temperature:     l.in.Temperature,
 	}
+	if l.in.NonStreaming {
+		return l.completeAndExecute(req)
+	}
 	exec = newStreamExec(l)
 	acc := llm.NewAccumulator()
 
@@ -779,6 +795,51 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 	stopReason = acc.StopReason
 	if err != nil {
 		return asst, exec, stopReason, err, false, false
+	}
+	// Drain tools to completion (or synthesize on abort).
+	cs, ab := exec.finish()
+	if cs {
+		return asst, exec, stopReason, nil, true, false
+	}
+	return asst, exec, stopReason, nil, false, ab
+}
+
+// completeAndExecute is the non-streaming counterpart of streamAndExecute's body.
+// It performs a single non-streaming model call, then replays the assembled
+// message as host events (thinking → text → each tool_use) and runs the same
+// tool executor. The returned tuple matches streamAndExecute so the turn loop is
+// oblivious to which path produced it. Usage is folded into l.usage exactly as
+// the streaming accumulator does, so the loop's per-turn usage delta, KindUsage
+// emission, and recorder all see identical numbers.
+func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
+	exec = newStreamExec(l)
+	msg, sr, usage, cerr := l.deps.CallModelSync(l.ctx, req)
+	if cerr != nil {
+		return asst, exec, "", cerr, false, false
+	}
+	l.usage.Add(usage)
+	asst = msg
+	stopReason = sr
+	for _, b := range msg.Content {
+		switch b.Type {
+		case llm.BlockThinking:
+			if b.Thinking != "" && !l.emit(Event{Kind: KindThinking, Text: b.Thinking}) {
+				return asst, exec, stopReason, nil, true, false
+			}
+		case llm.BlockText:
+			if b.Text != "" && !l.emit(Event{Kind: KindText, Text: b.Text}) {
+				return asst, exec, stopReason, nil, true, false
+			}
+		case llm.BlockToolUse:
+			block := b
+			if !l.emit(Event{Kind: KindToolUse, ToolUse: &block}) {
+				return asst, exec, stopReason, nil, true, false
+			}
+			exec.add(block)
+			if !exec.drain() { // surface any results ready so far (FIFO)
+				return asst, exec, stopReason, nil, true, false
+			}
+		}
 	}
 	// Drain tools to completion (or synthesize on abort).
 	cs, ab := exec.finish()

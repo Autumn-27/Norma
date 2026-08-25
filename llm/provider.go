@@ -89,12 +89,16 @@ func (c Config) retries() int {
 	return c.MaxRetries
 }
 
-// Provider's sole responsibility is streaming a completion. Hosts may implement
-// this interface to plug in private RPC backends (FR-03.7). The returned
-// iterator yields normalized events; a terminal error is delivered as
-// (zero, err) and ends iteration.
+// Provider produces a completion, either streamed (Stream) or in a single
+// non-streaming round-trip (Complete). Hosts may implement this interface to
+// plug in private RPC backends (FR-03.7). Stream's iterator yields normalized
+// events; a terminal error is delivered as (zero, err) and ends iteration.
+// Complete performs a real non-streaming request (the wire carries
+// stream:false and the whole JSON body is parsed at once) and returns the fully
+// assembled assistant message, the provider stop reason, and cumulative usage.
 type Provider interface {
 	Stream(ctx context.Context, req CompletionRequest) iter.Seq2[StreamEvent, error]
+	Complete(ctx context.Context, req CompletionRequest) (Message, string, Usage, error)
 }
 
 // NewProvider builds a built-in provider for cfg.Format. Missing APIKey/BaseURL

@@ -22,6 +22,17 @@ func (f fakeProvider) Stream(_ context.Context, _ llm.CompletionRequest) iter.Se
 	}
 }
 
+func (f fakeProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	acc := llm.NewAccumulator()
+	for ev, err := range f.Stream(ctx, req) {
+		if err != nil {
+			return llm.Message{}, "", llm.Usage{}, err
+		}
+		acc.Add(ev)
+	}
+	return acc.Message(), acc.StopReason, acc.Usage, nil
+}
+
 func TestSubagentDispatch(t *testing.T) {
 	agentTool := NewTool(Config{
 		Provider:    fakeProvider{reply: "subagent answer"},

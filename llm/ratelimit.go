@@ -151,3 +151,10 @@ func (rp *rateLimitedProvider) Stream(ctx context.Context, req CompletionRequest
 		}
 	}
 }
+
+func (rp *rateLimitedProvider) Complete(ctx context.Context, req CompletionRequest) (Message, string, Usage, error) {
+	if err := rp.l.Wait(ctx); err != nil {
+		return Message{}, "", Usage{}, err
+	}
+	return rp.p.Complete(ctx, req)
+}

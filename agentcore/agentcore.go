@@ -169,6 +169,12 @@ type Options struct {
 	// env var disables them for every session; this field is the per-session equivalent.
 	DisableBackgroundTasks bool
 
+	// NonStreaming runs every model call as a single non-streaming request
+	// (Provider.Complete) instead of a token stream. The host still receives the
+	// same event sequence (text/thinking/tool_use/usage), just delivered when the
+	// full response arrives rather than incrementally. Zero value = streaming.
+	NonStreaming bool
+
 	// Deps optionally overrides side-effect boundaries (testing/advanced use).
 	Deps harness.QueryDeps
 }
@@ -224,7 +230,7 @@ func NewSession(opts Options) *Session {
 	}
 	s := &Session{opts: opts}
 	if opts.Compaction != nil {
-		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens))
+		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens, opts.NonStreaming))
 	}
 	if opts.Plan != nil {
 		start := opts.PermissionMode
@@ -463,6 +469,7 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		Compactor:          s.compactor,
 		TokenBudget:        s.opts.TokenBudget,
 		EscalateMaxTokens:  s.opts.EscalateMaxTokens,
+		NonStreaming:       s.opts.NonStreaming,
 	}
 	if s.writer != nil {
 		in.Recorder = s.writer

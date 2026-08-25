@@ -40,6 +40,17 @@ func (p *captureProvider) Stream(_ context.Context, req llm.CompletionRequest) i
 	}
 }
 
+func (p *captureProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	acc := llm.NewAccumulator()
+	for ev, err := range p.Stream(ctx, req) {
+		if err != nil {
+			return llm.Message{}, "", llm.Usage{}, err
+		}
+		acc.Add(ev)
+	}
+	return acc.Message(), acc.StopReason, acc.Usage, nil
+}
+
 func asstText(s string) llm.Message {
 	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock(s)}}
 }
@@ -162,7 +173,7 @@ func TestPairForReplayDropsDangling(t *testing.T) {
 
 func TestProviderSummarizerReplaysRealMessages(t *testing.T) {
 	p := &captureProvider{reply: "<summary>DONE</summary>"}
-	s := ProviderSummarizer(p, 8000)
+	s := ProviderSummarizer(p, 8000, false)
 	head := []llm.Message{llm.UserText("hello"), asstText("hi")}
 	got, err := s(context.Background(), head)
 	if err != nil {
@@ -194,7 +205,7 @@ func TestProviderSummarizerReplaysRealMessages(t *testing.T) {
 
 func TestProviderSummarizerCapsAt20k(t *testing.T) {
 	p := &captureProvider{reply: "<summary>X</summary>"}
-	_, _ = ProviderSummarizer(p, 0)(context.Background(), []llm.Message{llm.UserText("hi")})
+	_, _ = ProviderSummarizer(p, 0, false)(context.Background(), []llm.Message{llm.UserText("hi")})
 	if p.reqs[0].MaxTokens != compactMaxOutputTokens {
 		t.Fatalf("maxTokens=%d, want %d", p.reqs[0].MaxTokens, compactMaxOutputTokens)
 	}
@@ -202,7 +213,7 @@ func TestProviderSummarizerCapsAt20k(t *testing.T) {
 
 func TestProviderSummarizerPTLRetry(t *testing.T) {
 	p := &captureProvider{reply: "<summary>OK</summary>", failN: 1} // first call overflows
-	s := ProviderSummarizer(p, 0)
+	s := ProviderSummarizer(p, 0, false)
 	head := []llm.Message{llm.UserText("u0"), asstText("a1"), llm.UserText("u1"), asstText("a2")}
 	got, err := s(context.Background(), head)
 	if err != nil {
@@ -228,7 +239,7 @@ func TestProviderSummarizerPTLRetry(t *testing.T) {
 
 func TestProviderSummarizerStreamingRetry(t *testing.T) {
 	p := &captureProvider{reply: "<summary>R</summary>", failN: 1, failErr: errors.New("network blip")}
-	s := ProviderSummarizer(p, 0)
+	s := ProviderSummarizer(p, 0, false)
 	got, err := s(context.Background(), []llm.Message{llm.UserText("hi")})
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +255,7 @@ func TestProviderSummarizerStreamingRetry(t *testing.T) {
 func TestProviderSummarizerNonOverflowErrorSurfaces(t *testing.T) {
 	// A persistent non-overflow error exhausts streaming retries and surfaces.
 	p := &captureProvider{reply: "x", failN: 99, failErr: errors.New("boom")}
-	if _, err := ProviderSummarizer(p, 0)(context.Background(), []llm.Message{llm.UserText("hi")}); err == nil {
+	if _, err := ProviderSummarizer(p, 0, false)(context.Background(), []llm.Message{llm.UserText("hi")}); err == nil {
 		t.Fatal("expected error to surface")
 	}
 	if len(p.reqs) != maxStreamingRetries {
