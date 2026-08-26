@@ -335,9 +335,19 @@ func parseResponsesResponse(raw []byte) (Message, string, Usage, error) {
 				}
 			}
 		case "reasoning":
+			// A reasoning item carries its thinking in `summary` (summary_text parts)
+			// and/or in `content` (reasoning_text parts). The streaming path already
+			// accepts both — response.reasoning_summary_text.delta and
+			// response.reasoning_text.delta — so read both here too; taking only
+			// `summary` drops the whole turn's thinking on models that fill `content`.
 			var think strings.Builder
 			for _, s := range item.Summary {
 				think.WriteString(s.Text)
+			}
+			for _, c := range item.Content {
+				if c.Type == "reasoning_text" {
+					think.WriteString(c.Text)
+				}
 			}
 			if think.Len() > 0 {
 				blocks = append(blocks, ContentBlock{Type: BlockThinking, Thinking: think.String()})

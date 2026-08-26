@@ -107,6 +107,28 @@ func TestResponsesComplete(t *testing.T) {
 	}
 }
 
+// A reasoning item may carry its thinking in `content` (reasoning_text parts)
+// instead of `summary`. The streaming path already handles both event kinds;
+// the non-streaming parse must not drop the content variant.
+func TestResponsesReasoningTextContent(t *testing.T) {
+	msg, _, _, err := parseResponsesResponse([]byte(`{"status":"completed","output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"deep thought"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}]}`))
+	if err != nil {
+		t.Fatalf("parse err: %v", err)
+	}
+	var think string
+	for _, b := range msg.Content {
+		if b.Type == BlockThinking {
+			think = b.Thinking
+		}
+	}
+	if think != "deep thought" {
+		t.Fatalf("thinking=%q", think)
+	}
+	if msg.Text() != "Hi" {
+		t.Fatalf("text=%q", msg.Text())
+	}
+}
+
 // TestToResponsesInput checks the neutral→input-item translation: tool_use →
 // function_call, tool_result → function_call_output (call_id paired), text →
 // role message, thinking dropped.

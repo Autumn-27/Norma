@@ -262,15 +262,17 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 }
 
 // parseOpenAIResponse decodes a non-streaming Chat Completions response body into
-// the neutral Message model. reasoning_content (a reasoning model's thinking) is
-// mapped to a thinking block; content to a text block; tool_calls to tool_use
-// blocks — the same shape the streaming path accumulates.
+// the neutral Message model. reasoning_content/reasoning (a reasoning model's
+// thinking) is mapped to a thinking block; content to a text block; tool_calls to
+// tool_use blocks — the same shape the streaming path accumulates.
 func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 	var r struct {
 		Choices []struct {
 			Message struct {
 				Content          string       `json:"content"`
 				ReasoningContent string       `json:"reasoning_content"`
+				Reasoning        string       `json:"reasoning"`
+				Refusal          string       `json:"refusal"`
 				ToolCalls        []oaToolCall `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
@@ -306,11 +308,16 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 	}
 	ch := r.Choices[0]
 	var blocks []ContentBlock
-	if ch.Message.ReasoningContent != "" {
-		blocks = append(blocks, ContentBlock{Type: BlockThinking, Thinking: ch.Message.ReasoningContent})
+	if think := pickReasoning(ch.Message.ReasoningContent, ch.Message.Reasoning); think != "" {
+		blocks = append(blocks, ContentBlock{Type: BlockThinking, Thinking: think})
 	}
 	if ch.Message.Content != "" {
 		blocks = append(blocks, TextBlock(ch.Message.Content))
+	} else if ch.Message.Refusal != "" {
+		// A refused turn carries content:null and the reason in `refusal`. Reading
+		// only content would hand the caller an empty assistant turn — the model
+		// did answer, it just declined.
+		blocks = append(blocks, TextBlock(ch.Message.Refusal))
 	}
 	for _, tc := range ch.Message.ToolCalls {
 		in := tc.Function.Arguments
@@ -329,12 +336,27 @@ func truncate(s string, max int) string {
 	return s[:max] + "…"
 }
 
+// pickReasoning returns the thinking text a Chat Completions payload carries.
+// reasoning_content is the DeepSeek-style field most gateways use; a plain
+// `reasoning` is what OpenRouter and vLLM's reasoning parsers emit. Reading only
+// the first silently drops a whole turn of thinking — and when the model puts
+// everything there (an unclosed </think>), the turn decodes to an empty message
+// that looks like the model just said nothing.
+func pickReasoning(reasoningContent, reasoning string) string {
+	if reasoningContent != "" {
+		return reasoningContent
+	}
+	return reasoning
+}
+
 func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, stopReason string, usage Usage, hasUsage bool) {
 	var f struct {
 		Choices []struct {
 			Delta struct {
 				Content          string       `json:"content"`
 				ReasoningContent string       `json:"reasoning_content"`
+				Reasoning        string       `json:"reasoning"`
+				Refusal          string       `json:"refusal"`
 				ToolCalls        []oaToolCall `json:"tool_calls"`
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
@@ -358,11 +380,15 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 		return nil, "", usage, hasUsage
 	}
 	ch := f.Choices[0]
-	if ch.Delta.ReasoningContent != "" {
-		evs = append(evs, StreamEvent{Type: SEThinkingDelta, Text: ch.Delta.ReasoningContent})
+	if think := pickReasoning(ch.Delta.ReasoningContent, ch.Delta.Reasoning); think != "" {
+		evs = append(evs, StreamEvent{Type: SEThinkingDelta, Text: think})
 	}
 	if ch.Delta.Content != "" {
 		evs = append(evs, StreamEvent{Type: SETextDelta, Text: ch.Delta.Content})
+	}
+	if ch.Delta.Refusal != "" {
+		// See parseOpenAIResponse: a refusal streams in `refusal`, not `content`.
+		evs = append(evs, StreamEvent{Type: SETextDelta, Text: ch.Delta.Refusal})
 	}
 	for _, tc := range ch.Delta.ToolCalls {
 		if !started[tc.Index] && (tc.ID != "" || tc.Function.Name != "") {
