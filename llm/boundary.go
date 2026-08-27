@@ -84,7 +84,9 @@ func MessagesAfterBoundary(msgs []Message) []Message {
 
 // MessagesForAPI returns the messages actually sent to the model: the working
 // set after the last boundary, with boundary markers stripped (they are
-// position markers, not content). The summary that follows a boundary is kept.
+// position markers, not content) and any tool block left unpaired by the
+// boundary cut dropped (pairToolBlocks). The summary that follows a boundary is
+// kept.
 func MessagesForAPI(msgs []Message) []Message {
 	working := MessagesAfterBoundary(msgs)
 	out := make([]Message, 0, len(working))
@@ -93,6 +95,53 @@ func MessagesForAPI(msgs []Message) []Message {
 			continue
 		}
 		out = append(out, m)
+	}
+	return pairToolBlocks(out)
+}
+
+// pairToolBlocks drops tool blocks left unpaired within msgs: a tool_result
+// whose tool_use is absent, or a tool_use whose tool_result is absent. The
+// working set is sliced at the last boundary, and that cut can fall inside a
+// tool exchange — leaving the post-boundary view starting with a tool_result
+// whose tool_use was summarized away (or ending with a tool_use whose result
+// is beyond the tail). Sent verbatim, the first makes the gateway 400 ("a
+// message with role 'tool' must be a response to a preceding message with
+// 'tool_calls'"). Well-formed histories have no unpaired blocks and pass through
+// unchanged; this also repairs a resumed transcript that already baked in an
+// orphan from an earlier compaction. Drops (not synthesizes), matching the
+// summarizer's pairForReplay.
+func pairToolBlocks(msgs []Message) []Message {
+	useIDs := make(map[string]bool)
+	resIDs := make(map[string]bool)
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			switch b.Type {
+			case BlockToolUse:
+				useIDs[b.ID] = true
+			case BlockToolResult:
+				resIDs[b.ToolUseID] = true
+			}
+		}
+	}
+	out := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		kept := make([]ContentBlock, 0, len(m.Content))
+		for _, b := range m.Content {
+			switch b.Type {
+			case BlockToolUse:
+				if !resIDs[b.ID] {
+					continue
+				}
+			case BlockToolResult:
+				if !useIDs[b.ToolUseID] {
+					continue
+				}
+			}
+			kept = append(kept, b)
+		}
+		if len(kept) > 0 {
+			out = append(out, Message{Role: m.Role, Content: kept})
+		}
 	}
 	return out
 }
