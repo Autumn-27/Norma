@@ -272,6 +272,7 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 				Content          string       `json:"content"`
 				ReasoningContent string       `json:"reasoning_content"`
 				Reasoning        string       `json:"reasoning"`
+				ReasoningText    string       `json:"reasoning_text"`
 				Refusal          string       `json:"refusal"`
 				ToolCalls        []oaToolCall `json:"tool_calls"`
 			} `json:"message"`
@@ -308,7 +309,7 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 	}
 	ch := r.Choices[0]
 	var blocks []ContentBlock
-	if think := pickReasoning(ch.Message.ReasoningContent, ch.Message.Reasoning); think != "" {
+	if think := pickReasoning(ch.Message.ReasoningContent, ch.Message.Reasoning, ch.Message.ReasoningText); think != "" {
 		blocks = append(blocks, ContentBlock{Type: BlockThinking, Thinking: think})
 	}
 	if ch.Message.Content != "" {
@@ -336,17 +337,22 @@ func truncate(s string, max int) string {
 	return s[:max] + "…"
 }
 
-// pickReasoning returns the thinking text a Chat Completions payload carries.
-// reasoning_content is the DeepSeek-style field most gateways use; a plain
-// `reasoning` is what OpenRouter and vLLM's reasoning parsers emit. Reading only
-// the first silently drops a whole turn of thinking — and when the model puts
-// everything there (an unclosed </think>), the turn decodes to an empty message
-// that looks like the model just said nothing.
-func pickReasoning(reasoningContent, reasoning string) string {
-	if reasoningContent != "" {
-		return reasoningContent
+// pickReasoning returns the thinking text a Chat Completions payload carries,
+// taking the first non-empty field in priority order. Gateways disagree on the
+// name: reasoning_content is the DeepSeek style; `reasoning` is what OpenRouter
+// and vLLM's reasoning parsers emit; `reasoning_text` shows up on some others.
+// Reading only one silently drops a whole turn of thinking — and when the model
+// puts everything there (an unclosed </think>), the turn decodes to an empty
+// message that looks like the model just said nothing. Trying them in order also
+// deduplicates: a gateway that echoes the same text in two fields (e.g. chutes.ai
+// sends reasoning_content AND reasoning) contributes it once, not twice.
+func pickReasoning(fields ...string) string {
+	for _, f := range fields {
+		if f != "" {
+			return f
+		}
 	}
-	return reasoning
+	return ""
 }
 
 func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, stopReason string, usage Usage, hasUsage bool) {
@@ -356,6 +362,7 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 				Content          string       `json:"content"`
 				ReasoningContent string       `json:"reasoning_content"`
 				Reasoning        string       `json:"reasoning"`
+				ReasoningText    string       `json:"reasoning_text"`
 				Refusal          string       `json:"refusal"`
 				ToolCalls        []oaToolCall `json:"tool_calls"`
 			} `json:"delta"`
@@ -380,7 +387,7 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 		return nil, "", usage, hasUsage
 	}
 	ch := f.Choices[0]
-	if think := pickReasoning(ch.Delta.ReasoningContent, ch.Delta.Reasoning); think != "" {
+	if think := pickReasoning(ch.Delta.ReasoningContent, ch.Delta.Reasoning, ch.Delta.ReasoningText); think != "" {
 		evs = append(evs, StreamEvent{Type: SEThinkingDelta, Text: think})
 	}
 	if ch.Delta.Content != "" {

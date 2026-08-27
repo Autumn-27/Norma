@@ -29,6 +29,26 @@ func TestOpenAIStreamReasoningContentWins(t *testing.T) {
 	}
 }
 
+// reasoning_text is the third field name some gateways use; it is read when the
+// other two are absent.
+func TestOpenAIStreamReasoningTextField(t *testing.T) {
+	started := map[int]bool{}
+	evs, _, _, _ := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning_text":"third field"}}]}`, started)
+	if len(evs) != 1 || evs[0].Type != SEThinkingDelta || evs[0].Text != "third field" {
+		t.Fatalf("evs=%+v", evs)
+	}
+}
+
+// The three reasoning fields are tried in priority order — a gateway that echoes
+// the same text in more than one field contributes it once, not concatenated.
+func TestOpenAIStreamReasoningDedup(t *testing.T) {
+	started := map[int]bool{}
+	evs, _, _, _ := parseOpenAIFrame(`{"choices":[{"index":0,"delta":{"reasoning_content":"once","reasoning":"once","reasoning_text":"once"}}]}`, started)
+	if len(evs) != 1 || evs[0].Text != "once" {
+		t.Fatalf("evs=%+v", evs)
+	}
+}
+
 // End-to-end replay of a vLLM (qwen) stream whose whole turn is reasoning +
 // tool_calls: the accumulated message must carry the thinking, not come back
 // empty.
