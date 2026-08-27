@@ -97,7 +97,9 @@ func TestAnthropicThinkingInheritsConfigWhenUnset(t *testing.T) {
 }
 
 func TestOpenAIPerRequestThinkingOverride(t *testing.T) {
-	stub := sse(`data: [DONE]`, ``)
+	// A non-empty stub: an empty completion would trip the empty-response retry
+	// (this test only inspects the request body, so give it minimal content).
+	stub := sse(`data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}`, ``, `data: [DONE]`, ``)
 	req := CompletionRequest{Thinking: "disabled", Messages: []Message{UserText("hi")}}
 	_, m := captureReq(t, Config{Format: FormatOpenAI, ThinkingType: "enabled"}, req, stub)
 	if thinkingType(m) != "disabled" {

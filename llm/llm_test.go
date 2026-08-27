@@ -130,7 +130,9 @@ func TestThinkingParamsAnthropic(t *testing.T) {
 }
 
 func TestThinkingParamsOpenAI(t *testing.T) {
-	stub := sse(`data: [DONE]`, ``)
+	// Non-empty stub so the empty-response retry doesn't fire (this test only
+	// inspects the request body).
+	stub := sse(`data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}`, ``, `data: [DONE]`, ``)
 	// set → fields present
 	m := captureBody(t, Config{Format: FormatOpenAI, ThinkingType: "disabled", ReasoningEffort: "max"}, stub)
 	if th, _ := m["thinking"].(map[string]any); th["type"] != "disabled" {

@@ -175,6 +175,22 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	return json.Marshal(body)
 }
 
+// emptyResponseRetries bounds how many times a completed-but-empty response is
+// re-requested before it is surfaced as-is. Kept low and separate from the
+// network-level retries() knob: an empty-response retry re-sends the whole
+// prompt (expensive on large contexts), and the failure is effectively binary —
+// a transient parser/sampling glitch clears on the next attempt, a deterministic
+// stall never does — so a third+ attempt mostly burns tokens.
+const emptyResponseRetries = 2
+
+// isEmptyResponseRetryable reports whether a completed response that produced no
+// content blocks should be retried. Only a normal stop qualifies: a max_tokens
+// truncation is the harness's to escalate (retrying would fight that), and any
+// stop that actually carried content never reaches this check.
+func isEmptyResponseRetryable(stopReason string) bool {
+	return stopReason == "end_turn" || stopReason == ""
+}
+
 func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter.Seq2[StreamEvent, error] {
 	return func(yield func(StreamEvent, error) bool) {
 		body, err := p.buildBody(req, true)
@@ -182,55 +198,85 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			yield(StreamEvent{}, err)
 			return
 		}
-		resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
-			r.Header.Set("content-type", "application/json")
-			r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
-			r.Header.Set("accept", "text/event-stream")
-		}, "openai")
-		if err != nil {
-			yield(StreamEvent{}, err)
-			return
-		}
-		defer resp.Body.Close()
+		for attempt := 0; ; attempt++ {
+			resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
+				r.Header.Set("content-type", "application/json")
+				r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
+				r.Header.Set("accept", "text/event-stream")
+			}, "openai")
+			if err != nil {
+				yield(StreamEvent{}, err)
+				return
+			}
 
-		scan := newSSEScanner(resp.Body)
-		started := map[int]bool{}
-		var stopReason string
-		var usage Usage
-		for {
-			_, data, serr := scan.next()
-			if serr == io.EOF {
-				yield(StreamEvent{Type: SEMessageDelta, StopReason: stopReason, Usage: usage}, nil)
-				yield(StreamEvent{Type: SEMessageStop}, nil)
+			// Consume one attempt's stream. State is fresh per attempt (a retry
+			// re-reads from a new response). emitted tracks whether any content
+			// event was yielded — a retry only happens when nothing was, so the
+			// consumer never sees duplicated content across attempts.
+			scan := newSSEScanner(resp.Body)
+			started := map[int]bool{}
+			var stopReason string
+			var usage Usage
+			emitted := false
+			consumerStopped := false
+			var streamErr error
+			for {
+				_, data, serr := scan.next()
+				if serr == io.EOF {
+					break
+				}
+				if serr != nil {
+					streamErr = serr
+					break
+				}
+				data = strings.TrimSpace(data)
+				if data == "" {
+					continue
+				}
+				if data == "[DONE]" {
+					break
+				}
+				evs, sr, u, ok := parseOpenAIFrame(data, started)
+				if sr != "" {
+					stopReason = sr
+				}
+				if ok {
+					usage = u
+				}
+				for _, ev := range evs {
+					emitted = true
+					if !yield(ev, nil) {
+						consumerStopped = true
+						break
+					}
+				}
+				if consumerStopped {
+					break
+				}
+			}
+			resp.Body.Close()
+
+			if consumerStopped {
 				return
 			}
-			if serr != nil {
-				yield(StreamEvent{}, serr)
+			if streamErr != nil {
+				yield(StreamEvent{}, streamErr)
 				return
 			}
-			data = strings.TrimSpace(data)
-			if data == "" {
+			// Empty completion: re-request a few times before surfacing it. Safe
+			// to retry because nothing was yielded downstream this attempt.
+			if !emitted && isEmptyResponseRetryable(stopReason) && attempt < emptyResponseRetries {
+				if !backoffSleep(ctx, attempt) {
+					yield(StreamEvent{}, ctx.Err())
+					return
+				}
 				continue
 			}
-			if data == "[DONE]" {
-				if !yield(StreamEvent{Type: SEMessageDelta, StopReason: stopReason, Usage: usage}, nil) {
-					return
-				}
-				yield(StreamEvent{Type: SEMessageStop}, nil)
+			if !yield(StreamEvent{Type: SEMessageDelta, StopReason: stopReason, Usage: usage}, nil) {
 				return
 			}
-			evs, sr, u, ok := parseOpenAIFrame(data, started)
-			if sr != "" {
-				stopReason = sr
-			}
-			if ok {
-				usage = u
-			}
-			for _, ev := range evs {
-				if !yield(ev, nil) {
-					return
-				}
-			}
+			yield(StreamEvent{Type: SEMessageStop}, nil)
+			return
 		}
 	}
 }
@@ -245,20 +291,34 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 	if err != nil {
 		return Message{}, "", Usage{}, err
 	}
-	resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
-		r.Header.Set("content-type", "application/json")
-		r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
-		r.Header.Set("accept", "application/json")
-	}, "openai")
-	if err != nil {
-		return Message{}, "", Usage{}, err
+	for attempt := 0; ; attempt++ {
+		resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
+			r.Header.Set("content-type", "application/json")
+			r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
+			r.Header.Set("accept", "application/json")
+		}, "openai")
+		if err != nil {
+			return Message{}, "", Usage{}, err
+		}
+		raw, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr != nil {
+			return Message{}, "", Usage{}, rerr
+		}
+		msg, stop, usage, perr := parseOpenAIResponse(raw)
+		if perr != nil {
+			return Message{}, "", Usage{}, perr
+		}
+		// Empty completion (no content blocks): re-request a few times before
+		// returning it, mirroring the streaming path.
+		if len(msg.Content) == 0 && isEmptyResponseRetryable(stop) && attempt < emptyResponseRetries {
+			if !backoffSleep(ctx, attempt) {
+				return Message{}, "", Usage{}, ctx.Err()
+			}
+			continue
+		}
+		return msg, stop, usage, nil
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return Message{}, "", Usage{}, err
-	}
-	return parseOpenAIResponse(raw)
 }
 
 // parseOpenAIResponse decodes a non-streaming Chat Completions response body into
