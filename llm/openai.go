@@ -44,11 +44,15 @@ type oaThinking struct {
 }
 
 type oaReq struct {
-	Model           string        `json:"model"`
-	Messages        []oaMessage   `json:"messages"`
-	Tools           []oaTool      `json:"tools,omitempty"`
-	MaxTokens       int           `json:"max_tokens,omitempty"`
-	Temperature     *float64      `json:"temperature,omitempty"`
+	Model    string      `json:"model"`
+	Messages []oaMessage `json:"messages"`
+	Tools    []oaTool    `json:"tools,omitempty"`
+	// MaxTokens and MaxCompletionTokens are mutually exclusive: buildBody fills
+	// exactly one of them per Config.MaxTokensField, and omitempty drops the
+	// other. Sending both would make OpenAI reject the request.
+	MaxTokens           int      `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int      `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64 `json:"temperature,omitempty"`
 	Stop            []string      `json:"stop,omitempty"`
 	Thinking        *oaThinking   `json:"thinking,omitempty"`
 	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
@@ -145,10 +149,17 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	body := oaReq{
 		Model:       p.cfg.Model,
 		Messages:    toOpenAIMessages(joinSystem(req.System), req.Messages),
-		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		Stop:        req.Stop,
 		Stream:      stream,
+	}
+	// The output cap goes into exactly one key. Reasoning models accept only
+	// "max_completion_tokens"; everything else still takes "max_tokens", which
+	// stays the default so existing configs are untouched.
+	if p.cfg.MaxTokensField == MaxTokensFieldCompletion {
+		body.MaxCompletionTokens = req.MaxTokens
+	} else {
+		body.MaxTokens = req.MaxTokens
 	}
 	// stream_options.include_usage is a streaming-only field; some gateways reject
 	// it on a non-streaming request, so send it only when streaming.

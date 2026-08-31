@@ -46,6 +46,11 @@ const (
 	FormatOpenAIResponses Format = "openai-responses"
 )
 
+// MaxTokensFieldCompletion is the Config.MaxTokensField value that moves the
+// OpenAI Chat Completions output cap onto "max_completion_tokens". Any other
+// value keeps the classic "max_tokens".
+const MaxTokensFieldCompletion = "max_completion_tokens"
+
 // Config configures the built-in providers (FR-03.4).
 type Config struct {
 	Format     Format
@@ -77,6 +82,16 @@ type Config struct {
 	// to "reasoning_effort"; for Anthropic to "output_config":{"effort":...}.
 	// Typical values: low / medium / high / max.
 	ReasoningEffort string
+	// MaxTokensField selects which request key carries the output cap on
+	// FormatOpenAI (Chat Completions). "" (default) sends the classic
+	// "max_tokens"; MaxTokensFieldCompletion sends "max_completion_tokens"
+	// instead. OpenAI's reasoning models reject "max_tokens" outright
+	// (unsupported_parameter) and accept only the newer key, whose budget covers
+	// reasoning tokens plus visible output; most OpenAI-compatible gateways still
+	// take the old one, hence the opt-in default. Exactly one key is ever sent.
+	// Ignored by the Anthropic and Responses formats, which name the field
+	// themselves ("max_tokens" / "max_output_tokens").
+	MaxTokensField string
 
 	limiter *rateLimiter // built from RateLimit by NewProvider; shared via the provider
 }
