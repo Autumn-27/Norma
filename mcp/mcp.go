@@ -42,12 +42,12 @@ func InProcessServer(server string, tools []InProcessTool) []tool.CoreTool {
 			Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 				return permission.AskUser("call MCP tool " + ToolName(server, it.Name) + "?")
 			},
-			Run: func(ctx context.Context, in json.RawMessage, _ *tool.ToolContext) (tool.Result, error) {
+			Run: func(ctx context.Context, in json.RawMessage, tc *tool.ToolContext) (tool.Result, error) {
 				text, err := it.Handler(ctx, in)
 				if err != nil {
 					return tool.Errorf("Error: " + err.Error()), nil
 				}
-				return tool.Text(text), nil
+				return tool.Text(tool.Capture(tc, text)), nil
 			},
 		}))
 	}
@@ -220,7 +220,7 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 			return permission.AskUser("call MCP tool " + full + "?")
 		},
-		Run: func(ctx context.Context, in json.RawMessage, _ *tool.ToolContext) (tool.Result, error) {
+		Run: func(ctx context.Context, in json.RawMessage, tc *tool.ToolContext) (tool.Result, error) {
 			var args any
 			if len(in) > 0 {
 				_ = json.Unmarshal(in, &args)
@@ -243,7 +243,7 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 			for _, blk := range res.Content {
 				text += blk.Text
 			}
-			return tool.Result{Content: []llm.ContentBlock{llm.TextBlock(text)}, IsError: res.IsError}, nil
+			return tool.Result{Content: []llm.ContentBlock{llm.TextBlock(tool.Capture(tc, text))}, IsError: res.IsError}, nil
 		},
 	})
 }
