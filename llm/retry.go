@@ -16,6 +16,8 @@ import (
 // any stream data is consumed — so retrying is safe (it can't duplicate
 // partially-streamed assistant output). A mid-stream drop is the caller's to
 // surface. Context cancellation is never retried and interrupts the backoff.
+// Count comes from cfg.retries(), the wait between attempts from
+// cfg.retryDelay() (exponential by default, fixed when Config.RetryInterval is set).
 func doStream(ctx context.Context, cfg Config, url string, body []byte, setHeaders func(*http.Request), errPrefix string) (*http.Response, error) {
 	// Rate limit once per logical request (outside the retry loop, so retries do
 	// not consume additional tokens). Shared across all callers of this provider.
@@ -53,7 +55,7 @@ func doStream(ctx context.Context, cfg Config, url string, body []byte, setHeade
 		if resp != nil {
 			resp.Body.Close()
 		}
-		if !backoffSleep(ctx, attempt) {
+		if !backoffSleep(ctx, cfg.retryDelay(attempt)) {
 			return nil, ctx.Err() // context cancelled during backoff
 		}
 	}
@@ -72,12 +74,21 @@ func isRetryableStatus(code int) bool {
 	return false
 }
 
-// backoffSleep waits an exponential backoff (0.5s, 1s, 2s, … capped at 8s),
-// interruptible by ctx. Returns false if the context was cancelled.
-func backoffSleep(ctx context.Context, attempt int) bool {
+// expBackoff is the default retry ladder: 0.5s, 1s, 2s, … capped at 8s. Used
+// whenever the caller did not pin a fixed interval on the Config.
+func expBackoff(attempt int) time.Duration {
 	d := 500 * time.Millisecond * (1 << attempt)
 	if d > 8*time.Second {
 		d = 8 * time.Second
+	}
+	return d
+}
+
+// backoffSleep waits d, interruptible by ctx. Returns false if the context was
+// cancelled (or d is non-positive, which never happens for a real wait).
+func backoffSleep(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
 	}
 	t := time.NewTimer(d)
 	defer t.Stop()

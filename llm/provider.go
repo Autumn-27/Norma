@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // StreamEventType enumerates the normalized streaming events every adapter
@@ -70,6 +71,19 @@ type Config struct {
 	// negative disables retrying. Only the pre-stream phase is retried (safe);
 	// a mid-stream drop is surfaced as an error.
 	MaxRetries int
+	// RetryInterval, when > 0, replaces the exponential backoff between
+	// establishment retries with this FIXED wait. 0 (default) keeps the
+	// 0.5s/1s/2s… ladder capped at 8s. A host that wants a predictable,
+	// operator-set cadence sets both MaxRetries and this.
+	RetryInterval time.Duration
+	// EmptyResponseRetries bounds how many times a completed-but-EMPTY response
+	// is re-requested (FormatOpenAI only; see emptyResponseRetries). 0 = default
+	// 2; negative disables. Separate from MaxRetries because an empty-response
+	// retry re-sends the whole prompt rather than re-establishing a request.
+	EmptyResponseRetries int
+	// EmptyResponseInterval, when > 0, replaces the exponential backoff before
+	// each empty-response retry with this FIXED wait. 0 keeps the ladder.
+	EmptyResponseInterval time.Duration
 	// RateLimit, when set, bounds the request rate shared across every caller of
 	// the built Provider (per-second and/or per-minute). Retries do not count.
 	RateLimit *RateLimit
@@ -105,6 +119,35 @@ func (c Config) retries() int {
 		return 0
 	}
 	return c.MaxRetries
+}
+
+// retryDelay is the wait before establishment retry number attempt (0-based):
+// the configured fixed interval when set, the exponential ladder otherwise.
+func (c Config) retryDelay(attempt int) time.Duration {
+	if c.RetryInterval > 0 {
+		return c.RetryInterval
+	}
+	return expBackoff(attempt)
+}
+
+// emptyRetries returns the effective empty-response retry count
+// (0 → default emptyResponseRetries; negative → 0).
+func (c Config) emptyRetries() int {
+	if c.EmptyResponseRetries == 0 {
+		return emptyResponseRetries
+	}
+	if c.EmptyResponseRetries < 0 {
+		return 0
+	}
+	return c.EmptyResponseRetries
+}
+
+// emptyRetryDelay is the wait before empty-response retry number attempt.
+func (c Config) emptyRetryDelay(attempt int) time.Duration {
+	if c.EmptyResponseInterval > 0 {
+		return c.EmptyResponseInterval
+	}
+	return expBackoff(attempt)
 }
 
 // Provider produces a completion, either streamed (Stream) or in a single

@@ -186,8 +186,9 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	return json.Marshal(body)
 }
 
-// emptyResponseRetries bounds how many times a completed-but-empty response is
-// re-requested before it is surfaced as-is. Kept low and separate from the
+// emptyResponseRetries is the DEFAULT bound on how many times a completed-but-
+// empty response is re-requested before it is surfaced as-is (override per
+// Config with EmptyResponseRetries). Kept low and separate from the
 // network-level retries() knob: an empty-response retry re-sends the whole
 // prompt (expensive on large contexts), and the failure is effectively binary —
 // a transient parser/sampling glitch clears on the next attempt, a deterministic
@@ -276,8 +277,8 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 			}
 			// Empty completion: re-request a few times before surfacing it. Safe
 			// to retry because nothing was yielded downstream this attempt.
-			if !emitted && isEmptyResponseRetryable(stopReason) && attempt < emptyResponseRetries {
-				if !backoffSleep(ctx, attempt) {
+			if !emitted && isEmptyResponseRetryable(stopReason) && attempt < p.cfg.emptyRetries() {
+				if !backoffSleep(ctx, p.cfg.emptyRetryDelay(attempt)) {
 					yield(StreamEvent{}, ctx.Err())
 					return
 				}
@@ -322,8 +323,8 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 		}
 		// Empty completion (no content blocks): re-request a few times before
 		// returning it, mirroring the streaming path.
-		if len(msg.Content) == 0 && isEmptyResponseRetryable(stop) && attempt < emptyResponseRetries {
-			if !backoffSleep(ctx, attempt) {
+		if len(msg.Content) == 0 && isEmptyResponseRetryable(stop) && attempt < p.cfg.emptyRetries() {
+			if !backoffSleep(ctx, p.cfg.emptyRetryDelay(attempt)) {
 				return Message{}, "", Usage{}, ctx.Err()
 			}
 			continue
