@@ -206,11 +206,17 @@ type budgetTracker struct {
 }
 
 type loop struct {
-	ctx   context.Context
-	in    QueryInput
-	deps  QueryDeps
-	yield func(Event, error) bool
-	sem   chan struct{} // bounds concurrent tool execution
+	ctx context.Context
+	// toolCtx bounds tool execution with the run's MaxDuration deadline, so a tool
+	// that overruns the wall-clock budget is interrupted mid-flight (the model call
+	// stays on ctx — streams are never cut mid-flight). Derived from ctx, so a parent
+	// cancellation (pause/kill/shutdown) still cancels it. Swapped to ctx once the
+	// wrap-up phase begins, so settlement tools run live, bounded only by settleMaxTurns.
+	toolCtx context.Context
+	in      QueryInput
+	deps    QueryDeps
+	yield   func(Event, error) bool
+	sem     chan struct{} // bounds concurrent tool execution
 
 	messages        []llm.Message
 	usage           llm.Usage
@@ -357,6 +363,16 @@ func (l *loop) run() {
 	l.turnCount = 1 // the first model call is turn 1
 	l.boundaryCount = countBoundaries(l.messages)
 	l.startTime = time.Now() // wall-clock baseline for MaxDuration
+	// toolCtx carries the MaxDuration deadline so a tool that overruns the wall-clock
+	// budget is interrupted mid-flight (rather than the run only noticing at the next
+	// turn boundary, which a hung tool never reaches). On interrupt the loop enters the
+	// wrap-up phase on the live parent ctx instead of aborting — see the tools branch.
+	l.toolCtx = l.ctx
+	if l.in.MaxDuration > 0 {
+		var stopTool context.CancelFunc
+		l.toolCtx, stopTool = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
+		defer stopTool()
+	}
 	iterations := 0
 	for {
 		if l.ctx.Err() != nil {
@@ -490,8 +506,27 @@ func (l *loop) run() {
 		// Surface any background-task completions that landed during this turn so
 		// the next model round sees them alongside the tool results.
 		l.injectTaskNotifications()
-		if aborted || l.ctx.Err() != nil {
+		// Parent-ctx cancellation (pause / planner kill / shutdown) → real abort, no wrap-up.
+		if l.ctx.Err() != nil {
 			l.finish(ReasonAbortedTools, l.ctx.Err(), "")
+			return
+		}
+		// aborted with the parent still alive ⇒ the run's own MaxDuration deadline (on
+		// toolCtx) interrupted an in-flight tool. Enter the wrap-up phase on the live
+		// parent ctx instead of dying, so a run whose tool overran the wall-clock budget
+		// still checkpoints its findings. Mid-tool interrupts are always time-driven
+		// (MaxTurns is only ever checked at the turn boundary), hence ReasonTimeout.
+		if aborted {
+			if l.settling {
+				l.finish(l.settleReason, nil, "")
+				return
+			}
+			if l.beginSettlement(ReasonTimeout, &schemas) {
+				l.toolCtx = l.ctx // wrap-up tools run live, bounded only by settleMaxTurns
+				l.lastContinue = ContinueNextTurn
+				continue
+			}
+			l.finish(ReasonTimeout, nil, "")
 			return
 		}
 

@@ -163,7 +163,11 @@ func (e *streamExec) finish() (consumerStopped, aborted bool) {
 		if !e.drain() {
 			return true, false
 		}
-		if e.l.ctx.Err() != nil {
+		// toolCtx cancellation is either a parent cancel (pause/kill/shutdown) or the
+		// run's own MaxDuration deadline firing on an in-flight tool. Either way we
+		// synthesize interrupted results and report aborted; the turn loop then decides
+		// (parent-cancel → abort, budget-only → wrap-up) via ctx vs toolCtx.
+		if e.l.toolCtx.Err() != nil {
 			return !e.drainSynthetic("tool execution interrupted"), true
 		}
 		if !e.pending() {
@@ -174,7 +178,7 @@ func (e *streamExec) finish() (consumerStopped, aborted bool) {
 		}
 		select {
 		case <-e.notify:
-		case <-e.l.ctx.Done():
+		case <-e.l.toolCtx.Done():
 		}
 	}
 }
