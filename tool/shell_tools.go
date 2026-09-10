@@ -75,7 +75,7 @@ func ms(v int, def int) time.Duration {
 
 // NewShellOpen 开一个交互会话。
 func NewShellOpen() CoreTool {
-	desc := "开一个持久 PTY 交互会话运行【交互式/需要真 TTY 的程序】(msfconsole/ssh 交互/mysql、python 等 REPL/密码提示/nc 会话)，返回 session_id。**一次性、非交互命令请用 Bash**。mode: interactive=阻塞到首个提示符/静默再返回启动输出; hands-free(默认)=立即返回, 之后用 shell_read 轮询; dispatch=立即返回, 完成时发通知; monitor=立即返回, 后台盯 watch 里的关键词, 命中即发通知(会话不结束, 适合守株待兔, 但会话只在本次运行内存活)。设 prompt_regex(如 'msf6? >\\s*$') 可精确判定命令完成。用完务必 shell_close。"
+	desc := "开一个持久 PTY 交互会话运行【交互式/需真 TTY 的程序】(msfconsole/ssh 交互/mysql、python 等 REPL/密码提示/nc 会话)，返回 session_id。**一次性、非交互命令用 Bash**。mode: interactive=阻塞到首个提示符/静默再返回启动输出; hands-free(默认)=立即返回, 之后用 shell_read 轮询; dispatch=立即返回, 完成时发通知; monitor=立即返回, 后台盯 watch 关键词命中即发通知(会话不结束, 仅本次运行内存活)。可设 prompt_regex(如 'msf6? >\\s*$')精确判定完成。用完务必 shell_close。"
 	schema := obj(map[string]any{
 		"command":          strProp("要运行的交互程序，如 'msfconsole -q' / 'ssh user@host' / 'python3'"),
 		"mode":             strProp("interactive | hands-free(默认) | dispatch | monitor"),
@@ -164,7 +164,7 @@ func NewShellOpen() CoreTool {
 
 // NewShellSend 向会话发送输入/按键。
 func NewShellSend() CoreTool {
-	desc := "向一个交互会话发送输入。可组合(按出现顺序发送): text=文本(不回车); submit=true 追加回车执行; keys=具名键[ctrl+c/tab/up/...]; hex=原始字节['0x1b',...]; paste=多行粘贴(bracketed paste,不逐行执行)。wait=true(默认)则等命令完成并带回增量输出。"
+	desc := "向一个交互会话发送输入：text/submit/keys/hex/paste 可组合，按出现顺序发送(各参数含义见字段)。wait=true(默认)等命令完成并带回增量输出。"
 	schema := obj(map[string]any{
 		"session_id":   strProp("会话 id(shell_open 返回)"),
 		"text":         strProp("要输入的文本(不自动回车)"),
@@ -250,7 +250,7 @@ func NewShellSend() CoreTool {
 
 // NewShellRead 读输出：增量流 或 整屏快照。
 func NewShellRead() CoreTool {
-	desc := "读一个交互会话的输出(不发输入)。view=stream(默认)增量原始流(流式工具首选,按 since_cursor 续读,可 drain 取全量); view=screen 整屏 vt 快照(vim/htop 等全屏程序)。"
+	desc := "读一个交互会话的输出(不发输入)。view=stream(默认)增量原始流(流式首选,续读/可 drain 取全量); view=screen 整屏 vt 快照(适合 vim/htop 等全屏程序)。"
 	schema := obj(map[string]any{
 		"session_id":   strProp("会话 id"),
 		"view":         strProp("stream(默认) | screen"),
