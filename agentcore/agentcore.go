@@ -90,8 +90,8 @@ type Options struct {
 	// EnableWebSearch adds the network-facing web_search tool (permission-gated).
 	EnableWebSearch bool
 	// WebSearchBackend selects the search backend: "ddgs" (DuckDuckGo, no key),
-	// "brave-free" (Brave Search API), or "tavily" (Tavily Search API). Empty
-	// defaults to "ddgs".
+	// "brave-free" (Brave Search API), "tavily" (Tavily Search API), or
+	// "deepseek" (DeepSeek's server-side search). Empty defaults to "ddgs".
 	WebSearchBackend string
 	// BraveSearchAPIKey authenticates the "brave-free" backend. Required only when
 	// WebSearchBackend == "brave-free".
@@ -99,6 +99,14 @@ type Options struct {
 	// TavilySearchAPIKey authenticates the "tavily" backend. Required only when
 	// WebSearchBackend == "tavily".
 	TavilySearchAPIKey string
+	// DeepSeekSearch* configure the "deepseek" backend, which has no search API
+	// of its own: it spends one call on DeepSeek's Anthropic-format messages
+	// endpoint per search (the web_search_20250305 server tool). BaseURL must be
+	// the Anthropic-format root — DeepSeek's OpenAI-format endpoint rejects
+	// server tools. All three are required when WebSearchBackend == "deepseek".
+	DeepSeekSearchBaseURL string
+	DeepSeekSearchAPIKey  string
+	DeepSeekSearchModel   string
 	// WebSearchProxy, when set, routes web_search requests through this http(s)
 	// proxy URL — useful when the search endpoint is only reachable via a proxy.
 	WebSearchProxy string
@@ -253,7 +261,7 @@ func NewSession(opts Options) *Session {
 		// A misconfigured backend (unknown name, or brave-free without a key)
 		// drops the tool rather than failing the whole session — the rest of the
 		// agent stays usable and the missing tool surfaces the misconfig.
-		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
+		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
 			tools = append(tools, ws)
 		}
 	}

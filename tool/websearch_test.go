@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -124,5 +125,111 @@ func TestUnwrapDDGHref(t *testing.T) {
 	// Sanity: url encoding round-trips as expected.
 	if _, err := url.Parse("//duckduckgo.com/l/?uddg=x"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDeepSeekConfigValidation(t *testing.T) {
+	full := WebSearchConfig{Backend: "deepseek", DeepSeekBaseURL: "https://api.deepseek.com/anthropic", DeepSeekAPIKey: "k", DeepSeekModel: "deepseek-chat"}
+	if _, err := NewWebSearch(full); err != nil {
+		t.Fatalf("fully configured deepseek backend should build: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		mut  func(*WebSearchConfig)
+	}{
+		{"missing key", func(c *WebSearchConfig) { c.DeepSeekAPIKey = "" }},
+		{"missing base url", func(c *WebSearchConfig) { c.DeepSeekBaseURL = "" }},
+		{"missing model", func(c *WebSearchConfig) { c.DeepSeekModel = "" }},
+	} {
+		cfg := full
+		tc.mut(&cfg)
+		if _, err := NewWebSearch(cfg); err == nil {
+			t.Fatalf("deepseek backend with %s should error", tc.name)
+		}
+	}
+}
+
+func TestDeepSeekMessagesURL(t *testing.T) {
+	want := "https://api.deepseek.com/anthropic/v1/messages"
+	for _, in := range []string{
+		"https://api.deepseek.com/anthropic",
+		"https://api.deepseek.com/anthropic/",
+		"https://api.deepseek.com/anthropic/v1",
+		"https://api.deepseek.com/anthropic/v1/messages",
+	} {
+		if got := deepseekMessagesURL(in); got != want {
+			t.Errorf("deepseekMessagesURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestParseDeepSeekStream(t *testing.T) {
+	// Mirrors a real DeepSeek stream: hits arrive whole inside content_block_start
+	// (never as deltas), an empty title needs a host fallback, the same URL can
+	// repeat across rounds, and a tool-side failure rides in the same array as
+	// the hits. Unknown fields ("caller") must not break decoding.
+	stream := `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"call_00","name":"web_search","input":{},"caller":{"type":"direct"}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"x\"}"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"call_00","content":[{"type":"web_search_result","title":"First","url":"https://a.example/1","encrypted_content":"zzz"},{"type":"web_search_result","title":"","url":"https://b.example/2"},{"type":"web_search_result","title":"Dup","url":"https://a.example/1"}]}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"call_01","content":[{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}]}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}
+
+data: [DONE]
+
+`
+	got, err := parseDeepSeekStream(strings.NewReader(stream), 10)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 results (dup dropped, error item skipped), got %d: %+v", len(got), got)
+	}
+	if got[0].Title != "First" || got[0].URL != "https://a.example/1" || got[0].Position != 1 {
+		t.Errorf("first result wrong: %+v", got[0])
+	}
+	// Empty title falls back to the host so the model still has a label.
+	if got[1].Title != "b.example" {
+		t.Errorf("empty title should fall back to host, got %q", got[1].Title)
+	}
+	// DeepSeek only returns encrypted page content, so there is never a snippet.
+	if got[0].Description != "" {
+		t.Errorf("description should stay empty, got %q", got[0].Description)
+	}
+}
+
+func TestParseDeepSeekStreamLimitAndErrors(t *testing.T) {
+	hits := `{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","content":[{"type":"web_search_result","title":"A","url":"https://a.example"},{"type":"web_search_result","title":"B","url":"https://b.example"},{"type":"web_search_result","title":"C","url":"https://c.example"}]}}`
+	got, err := parseDeepSeekStream(strings.NewReader("data: "+hits+"\n\n"), 2)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("limit should cap results at 2, got %d", len(got))
+	}
+
+	// A failure with no usable hits must surface rather than look like "no results".
+	onlyErr := `data: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","content":[{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}]}}`
+	if _, err := parseDeepSeekStream(strings.NewReader(onlyErr+"\n\n"), 5); err == nil {
+		t.Fatal("a result-less stream carrying an error_code should error")
+	}
+
+	// Stream-level error frames propagate too.
+	streamErr := `data: {"type":"error","error":{"type":"overloaded_error","message":"boom"}}`
+	if _, err := parseDeepSeekStream(strings.NewReader(streamErr+"\n\n"), 5); err == nil {
+		t.Fatal("stream error frame should error")
+	}
+
+	// An empty but well-formed stream is "no results", not a failure.
+	if res, err := parseDeepSeekStream(strings.NewReader("data: [DONE]\n\n"), 5); err != nil || len(res) != 0 {
+		t.Fatalf("empty stream should yield no results and no error, got %v / %v", res, err)
 	}
 }

@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,8 +34,9 @@ type searchProvider interface {
 // WebSearchConfig selects and configures the active search backend.
 type WebSearchConfig struct {
 	// Backend chooses the provider: "ddgs" (DuckDuckGo scrape, no key),
-	// "brave-free" (Brave Search API, needs BraveAPIKey), or "tavily" (Tavily
-	// Search API, needs TavilyAPIKey). Empty defaults to "ddgs".
+	// "brave-free" (Brave Search API, needs BraveAPIKey), "tavily" (Tavily
+	// Search API, needs TavilyAPIKey), or "deepseek" (DeepSeek's server-side
+	// web search, needs DeepSeek*). Empty defaults to "ddgs".
 	Backend string
 	// BraveAPIKey authenticates the "brave-free" backend. Required (and only
 	// used) when Backend == "brave-free".
@@ -42,6 +44,16 @@ type WebSearchConfig struct {
 	// TavilyAPIKey authenticates the "tavily" backend. Required (and only
 	// used) when Backend == "tavily".
 	TavilyAPIKey string
+	// DeepSeekBaseURL / DeepSeekAPIKey / DeepSeekModel configure the "deepseek"
+	// backend. That backend does NOT call a search API — DeepSeek has none.
+	// Search there only exists inside its Anthropic-compatible messages endpoint
+	// as the web_search_20250305 server tool, so this provider spends one model
+	// call per search. BaseURL must be the Anthropic-format root (the provider
+	// appends /v1/messages); the OpenAI-format endpoint rejects server tools
+	// outright ("unknown variant, expected `function`").
+	DeepSeekBaseURL string
+	DeepSeekAPIKey  string
+	DeepSeekModel   string
 	// Proxy, when set, routes search requests through this http(s) proxy URL —
 	// useful when the search endpoint is only reachable via a proxy. Empty = direct.
 	Proxy string
@@ -110,8 +122,22 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 			return nil, fmt.Errorf("web_search: backend %q requires a Tavily API key", backend)
 		}
 		return &tavilyProvider{apiKey: key, client: client, endpoint: tavilyEndpoint}, nil
+	case "deepseek":
+		key := strings.TrimSpace(cfg.DeepSeekAPIKey)
+		if key == "" {
+			return nil, fmt.Errorf("web_search: backend %q requires a DeepSeek API key", backend)
+		}
+		base := strings.TrimSpace(cfg.DeepSeekBaseURL)
+		if base == "" {
+			return nil, fmt.Errorf("web_search: backend %q requires the Anthropic-format base URL of the DeepSeek profile", backend)
+		}
+		model := strings.TrimSpace(cfg.DeepSeekModel)
+		if model == "" {
+			return nil, fmt.Errorf("web_search: backend %q requires a model name", backend)
+		}
+		return &deepseekProvider{apiKey: key, model: model, client: client, endpoint: deepseekMessagesURL(base)}, nil
 	default:
-		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", or \"tavily\")", backend)
+		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", or \"deepseek\")", backend)
 	}
 }
 
@@ -150,8 +176,14 @@ func webSearchRunner(prov searchProvider) func(context.Context, json.RawMessage,
 		if limit > 20 {
 			limit = 20
 		}
-		// Hard wall-clock cap so a slow/rate-limited backend can't hang the agent loop.
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// Hard wall-clock cap so a slow/rate-limited backend can't hang the agent
+		// loop. A backend that runs a model call per search (deepseek) declares a
+		// longer cap of its own; plain HTTP backends keep the 30s default.
+		wall := 30 * time.Second
+		if tp, ok := prov.(interface{ Timeout() time.Duration }); ok {
+			wall = tp.Timeout()
+		}
+		cctx, cancel := context.WithTimeout(ctx, wall)
 		defer cancel()
 		results, err := prov.Search(cctx, query, limit)
 		if err != nil {
@@ -401,7 +433,194 @@ func (p *tavilyProvider) Search(ctx context.Context, query string, limit int) ([
 	return out, nil
 }
 
+// ─── DeepSeek (server-side web search) ───────────────────────────────────────
+// Unlike every other backend here, DeepSeek exposes no search API to call. Its
+// search only exists inside the Anthropic-compatible messages endpoint as the
+// web_search_20250305 *server* tool: we declare the tool, DeepSeek's own model
+// decides to search, DeepSeek's servers run the search, and the hits come back
+// as web_search_tool_result blocks in the same response. So one search here
+// costs one model call, and the queries are chosen server-side rather than by
+// the caller (query below is a search *instruction*, not a literal term).
+//
+// Streaming is mandatory, not a preference: DeepSeek's non-streaming response
+// embeds raw newlines inside JSON string literals, which encoding/json rejects
+// with "invalid character '\n' in string literal". The SSE frames are clean.
+
+// deepseekMessagesURL normalizes a profile base URL to the messages endpoint,
+// tolerating bases written with or without the /v1 suffix.
+func deepseekMessagesURL(base string) string {
+	b := strings.TrimRight(strings.TrimSpace(base), "/")
+	switch {
+	case strings.HasSuffix(b, "/v1/messages"):
+		return b
+	case strings.HasSuffix(b, "/v1"):
+		return b + "/messages"
+	default:
+		return b + "/v1/messages"
+	}
+}
+
+type deepseekProvider struct {
+	apiKey   string
+	model    string
+	client   *http.Client
+	endpoint string
+}
+
+func (p *deepseekProvider) Name() string { return "deepseek" }
+
+// Timeout overrides the runner's default cap: this backend runs a full model
+// inference (plus the server-side search) per call, so it needs far more room
+// than a plain search HTTP request.
+func (p *deepseekProvider) Timeout() time.Duration { return 120 * time.Second }
+
+func (p *deepseekProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	// One server-side search returns ~10 hits; allow a second round only when the
+	// caller asked for more than that. Capped so a runaway loop can't bill us.
+	maxUses := (limit + 9) / 10
+	if maxUses < 1 {
+		maxUses = 1
+	}
+	if maxUses > 3 {
+		maxUses = 3
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":      p.model,
+		"max_tokens": 1024,
+		"stream":     true,
+		"messages": []any{map[string]any{
+			"role":    "user",
+			"content": "Search the web for: " + query + "\n\nUse the web_search tool. Do not answer from memory; reply with at most one short sentence once the search is done.",
+		}},
+		"tools": []any{map[string]any{
+			"type":     "web_search_20250305",
+			"name":     "web_search",
+			"max_uses": maxUses,
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("x-api-key", p.apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("DeepSeek search returned HTTP %d: %s", resp.StatusCode, truncate(strings.TrimSpace(string(raw)), 300))
+	}
+	return parseDeepSeekStream(resp.Body, limit)
+}
+
+// parseDeepSeekStream pulls web_search_tool_result blocks out of the SSE stream.
+// Results arrive whole inside content_block_start (they are not deltas), so only
+// that frame matters; text/thinking deltas are skipped.
+func parseDeepSeekStream(r io.Reader, limit int) ([]SearchResult, error) {
+	sc := bufio.NewScanner(io.LimitReader(r, maxFetchBytes))
+	// A single result frame carries ~10 hits each with a multi-KB encrypted_content
+	// payload — observed at ~58KB, already past bufio's 64KB default ceiling.
+	sc.Buffer(make([]byte, 0, 64*1024), maxFetchBytes)
+
+	var out []SearchResult
+	var toolErr string
+	seen := map[string]bool{}
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(line[len("data:"):])
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var frame struct {
+			Type         string `json:"type"`
+			ContentBlock struct {
+				Type    string `json:"type"`
+				Content []struct {
+					Type      string `json:"type"`
+					Title     string `json:"title"`
+					URL       string `json:"url"`
+					ErrorCode string `json:"error_code"`
+				} `json:"content"`
+			} `json:"content_block"`
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+			continue // tolerate keep-alives and any frame shape we don't model
+		}
+		if frame.Type == "error" && frame.Error.Message != "" {
+			return nil, fmt.Errorf("DeepSeek search stream error: %s", frame.Error.Message)
+		}
+		if frame.Type != "content_block_start" || frame.ContentBlock.Type != "web_search_tool_result" {
+			continue
+		}
+		for _, hit := range frame.ContentBlock.Content {
+			// Failures ride in the same array as hits, e.g.
+			// {"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}.
+			if hit.ErrorCode != "" {
+				if toolErr == "" {
+					toolErr = hit.ErrorCode
+				}
+				continue
+			}
+			if hit.URL == "" || seen[hit.URL] {
+				continue
+			}
+			seen[hit.URL] = true
+			out = append(out, SearchResult{
+				Title: firstNonEmpty(hit.Title, hostOf(hit.URL)),
+				URL:   hit.URL,
+				// Description stays empty by design: DeepSeek returns page content
+				// only as encrypted_content, which is not readable here. Follow up
+				// with WebFetch when a snippet is needed.
+				Position: len(out) + 1,
+			})
+			if len(out) >= limit {
+				return out, nil
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("could not read DeepSeek search stream: %w", err)
+	}
+	// Only surface a tool-side failure when it cost us every result.
+	if len(out) == 0 && toolErr != "" {
+		return nil, fmt.Errorf("DeepSeek web search failed: %s", toolErr)
+	}
+	return out, nil
+}
+
 // ─── small helpers ───────────────────────────────────────────────────────────
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// hostOf is the title fallback for hits DeepSeek returns with an empty title.
+func hostOf(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
+}
 
 // hasClass reports whether an element node's class attribute contains class
 // (whitespace-delimited match).
