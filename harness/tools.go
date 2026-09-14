@@ -9,6 +9,16 @@ import (
 	"github.com/Autumn-27/norma/tool"
 )
 
+// rawInputTool is the optional opt-out from schema validation. Discovered by
+// assertion rather than declared on tool.CoreTool, so hosts implementing that
+// interface are unaffected.
+type rawInputTool interface{ AcceptsRawInput() bool }
+
+func acceptsRawInput(t tool.CoreTool) bool {
+	r, ok := t.(rawInputTool)
+	return ok && r.AcceptsRawInput()
+}
+
 // execOne resolves, permission-checks, and runs a single tool call, returning a
 // tool_result block and any extra messages the tool injects after its result
 // (Result.Extra — e.g. the Skill tool's instructions message). It never panics;
@@ -23,8 +33,15 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 	input := use.Input
 
 	// Schema validation (FR-04.5).
-	if err := tool.ValidateInput(t.InputSchema(), input); err != nil {
-		return llm.ToolResultText(use.ID, "Error: invalid tool input: "+err.Error(), true), nil
+	//
+	// A tool may opt out by reporting AcceptsRawInput: it parses its own
+	// arguments and would rather repair a malformed call than have it rejected
+	// here, where the only possible answer is a generic error. The schema is
+	// still advertised to the model either way — see tool.Spec.RawInput.
+	if !acceptsRawInput(t) {
+		if err := tool.ValidateInput(t.InputSchema(), input); err != nil {
+			return llm.ToolResultText(use.ID, "Error: invalid tool input: "+err.Error(), true), nil
+		}
 	}
 
 	mode := l.in.PermissionMode

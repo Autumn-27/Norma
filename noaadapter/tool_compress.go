@@ -18,6 +18,19 @@ func newCompressTool(sess *Session) tool.CoreTool {
 		Name:        noa.CompressToolName,
 		Description: noa.CompressToolDescription,
 		Schema:      noa.CompressToolSchema(),
+		// The model's arguments reach runCompress exactly as they arrived.
+		//
+		// ParseCompressArgs exists to recover ranges from a call a provider
+		// mangled — truncated mid-object, wrapped in a code fence, carrying a
+		// trailing comma, or with the array stringified. None of those is valid
+		// JSON, so the harness's schema check would reject them first and the
+		// recovery would never run; the model would get "invalid tool input"
+		// instead of the shape guidance formatParseError writes, and the turn's
+		// one compression attempt would be spent on a validation error.
+		//
+		// The schema is still advertised (Schema above), so the model knows what
+		// to aim for. This only removes the gate, not the instruction.
+		RawInput: true,
 		// Not read-only: it mutates session state and writes archives.
 		ReadOnly: func(json.RawMessage) bool { return false },
 		// Not concurrency-safe: two compressions racing on the same state would
