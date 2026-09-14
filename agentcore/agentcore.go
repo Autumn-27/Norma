@@ -61,8 +61,24 @@ type Options struct {
 	Hooks harness.HookRunner
 
 	// Compaction, when non-nil, enables automatic context-window management,
-	// summarizing with the same Provider.
+	// summarizing with the same Provider. Ignored when Compactor is set.
 	Compaction *compaction.Config
+
+	// Compactor lets the host take over context management entirely. Setting it
+	// means "I manage the context myself": the built-in Compaction is IGNORED.
+	// The two are mutually exclusive — the session holds a single compactor, so
+	// they can never both run.
+	//
+	// A Compactor that also implements harness.ContextView builds the request
+	// message array itself, replacing llm.MessagesForAPI.
+	Compactor harness.Compactor
+
+	// OnWarn, when set, receives configuration warnings raised while building the
+	// session — misconfigurations the SDK works around rather than rejecting. The
+	// SDK writes nothing to stdout/stderr on its own, so a host that wants to see
+	// these must wire them somewhere (log.Printf, a structured logger, a test
+	// buffer). Called synchronously during NewSession.
+	OnWarn func(string)
 
 	// Plan, when non-nil, enables plan mode (read-only exploration → approval →
 	// implementation) with EnterPlanMode/ExitPlanMode tools.
@@ -237,7 +253,17 @@ func NewSession(opts Options) *Session {
 		opts.PermissionMode = permission.ModeDefault
 	}
 	s := &Session{opts: opts}
-	if opts.Compaction != nil {
+	// Exactly one context manager. Compactor (host-supplied) wins over the
+	// built-in Compaction: a session holds a single compactor, so the two can
+	// never both run — which matters because they have incompatible contracts
+	// (Compaction rewrites l.messages in place; a ContextView must not).
+	if opts.Compactor != nil {
+		if opts.Compaction != nil {
+			s.warn("both Compactor and Compaction are set — Compaction is IGNORED. " +
+				"They are mutually exclusive context managers; set only one.")
+		}
+		s.compactor = opts.Compactor
+	} else if opts.Compaction != nil {
 		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens, opts.NonStreaming))
 	}
 	if opts.Plan != nil {
@@ -380,6 +406,13 @@ func buildSystemReminder(extra string) string {
 	}
 	b.WriteString("\n</system-reminder>")
 	return b.String()
+}
+
+// warn reports a configuration warning to the host, if it asked for them.
+func (s *Session) warn(msg string) {
+	if s.opts.OnWarn != nil {
+		s.opts.OnWarn("agentcore: " + msg)
+	}
 }
 
 func (s *Session) system() []string {

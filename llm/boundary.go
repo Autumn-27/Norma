@@ -85,7 +85,7 @@ func MessagesAfterBoundary(msgs []Message) []Message {
 // MessagesForAPI returns the messages actually sent to the model: the working
 // set after the last boundary, with boundary markers stripped (they are
 // position markers, not content) and any tool block left unpaired by the
-// boundary cut dropped (pairToolBlocks). The summary that follows a boundary is
+// boundary cut dropped (PairToolBlocks). The summary that follows a boundary is
 // kept.
 func MessagesForAPI(msgs []Message) []Message {
 	working := MessagesAfterBoundary(msgs)
@@ -96,10 +96,10 @@ func MessagesForAPI(msgs []Message) []Message {
 		}
 		out = append(out, m)
 	}
-	return pairToolBlocks(out)
+	return PairToolBlocks(out)
 }
 
-// pairToolBlocks drops tool blocks left unpaired within msgs: a tool_result
+// PairToolBlocks drops tool blocks left unpaired within msgs: a tool_result
 // whose tool_use is absent, or a tool_use whose tool_result is absent. The
 // working set is sliced at the last boundary, and that cut can fall inside a
 // tool exchange — leaving the post-boundary view starting with a tool_result
@@ -110,7 +110,7 @@ func MessagesForAPI(msgs []Message) []Message {
 // unchanged; this also repairs a resumed transcript that already baked in an
 // orphan from an earlier compaction. Drops (not synthesizes), matching the
 // summarizer's pairForReplay.
-func pairToolBlocks(msgs []Message) []Message {
+func PairToolBlocks(msgs []Message) []Message {
 	useIDs := make(map[string]bool)
 	resIDs := make(map[string]bool)
 	for _, m := range msgs {

@@ -140,6 +140,19 @@ type Compactor interface {
 	IsOverflow(err error) bool
 }
 
+// ContextView is optionally implemented by a Compactor that builds the request
+// message array itself, replacing llm.MessagesForAPI. Hosts with their own
+// context manager (e.g. model-driven compression) implement it to project the
+// history per request without mutating it.
+//
+// View MUST be pure: the returned slice is used for this request only and is
+// never written back to the loop's history. Implementations that depend on
+// stable message identity (content hashing, per-message refs) rely on this —
+// writing back would change message bytes and invalidate that identity.
+type ContextView interface {
+	View(ctx context.Context, msgs []llm.Message) []llm.Message
+}
+
 // Recorder receives conversation events for durable transcript persistence
 // (implemented in package transcript). RecordMessage fires once per new message
 // in birth order; usage carries the token delta attributed to that turn
@@ -752,9 +765,20 @@ func messageHasToolUse(m llm.Message, name string) bool {
 // tool_use blocks to the streaming executor as they finish — so tools begin
 // running while the rest of the message is still arriving. It returns the
 // assembled assistant message, the executor, the stop reason, and flags.
+// requestMessages builds the message array for one model request. A Compactor
+// that implements ContextView takes over the projection entirely; otherwise the
+// default working set (post-boundary, unpaired tool blocks dropped) is used.
+// Either way l.messages is left untouched.
+func (l *loop) requestMessages() []llm.Message {
+	if v, ok := l.in.Compactor.(ContextView); ok {
+		return v.View(l.ctx, l.messages)
+	}
+	return llm.MessagesForAPI(l.messages)
+}
+
 func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	l.maybeInjectTodoReminder()
-	msgs := llm.MessagesForAPI(l.messages)
+	msgs := l.requestMessages()
 	if l.in.SystemReminder != "" {
 		msgs = append([]llm.Message{llm.UserText(l.in.SystemReminder)}, msgs...)
 	}
