@@ -150,18 +150,127 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 	tokens := s.resolveTokenCount(cores)
 	s.lastTokenCount = tokens
 
+	// A new user turn means the situation changed; give the model a clean slate
+	// before deciding whether to nudge.
+	s.notePriorTurnOutcome(msgs)
+
+	cfg := s.cfg
+	if s.emergencyFloor > 0 {
+		// A prompt-too-long error taught us the real window. Build to it, rather
+		// than to the configured one that just failed.
+		cfg.ModelContextLimit = s.emergencyFloor
+	}
+
 	res := noa.ProcessTurn(noa.ProcessTurnInput{
 		Messages:   cores,
 		State:      s.state,
-		Config:     s.cfg,
+		Config:     cfg,
 		TokenCount: tokens,
 	})
 	s.state = res.State
-	s.lastView = res.Messages
 	s.sidecar = sc
 	s.lastTruncatedCount = res.TruncatedCount
 
-	return Reassemble(res.Messages, msgs, sc, ReassembleOptions{State: &s.state, Tag: true})
+	view := res.Messages
+	s.nudgedLastTurn = false
+	if res.Nudge != nil && s.nudgeAllowed(tokens) {
+		voice, text := noa.RenderNudgeText(*res.Nudge, noa.NudgeSections{})
+		_ = voice
+		view = append(view, noa.CoreMessage{
+			ID: noa.NudgeMessageID, Role: noa.RoleUser, ContentType: noa.CTText, Text: text,
+		})
+		s.nudgedLastTurn = true
+	}
+	// lastView is what the model's refs will be resolved against, so it must be
+	// the array the model actually sees — nudge included.
+	s.lastView = view
+
+	return Reassemble(view, msgs, sc, ReassembleOptions{State: &s.state, Tag: true})
+}
+
+// nudgeAllowed gates injection on the failure ladder.
+//
+// After MaxCompressAttempts consecutive failures or outright refusals, nudging
+// stops: each one costs a couple of thousand tokens, and replaying it into a
+// context that is already too big makes the problem it describes worse.
+//
+// Suppression is not permanent. It lifts once the context has grown by a full
+// cadence step, because by then the situation genuinely differs from the one
+// the model declined to act on. Without that release the first three failures
+// in a session would silence nudging for good. Callers hold the lock.
+func (s *Session) nudgeAllowed(tokenCount int) bool {
+	if s.attempts < s.cfg.MaxCompressAttempts {
+		return true
+	}
+	floor := noa.NudgeGrowthFloor(s.cfg)
+	if tokenCount-s.suppressedAtTokens >= floor {
+		s.attempts = 0
+		s.suppressedAtTokens = 0
+		return true
+	}
+	return false
+}
+
+// notePriorTurnOutcome reacts to what happened since the last view.
+//
+// Two things reset or advance the ladder here:
+//
+//   - A genuine new user message means new instructions and a new situation, so
+//     the model deserves a fresh start.
+//   - A nudge that drew no Compress call at all counts as a failure. Upstream
+//     only counts calls that FAILED, which leaves the cheapest way to ignore a
+//     nudge — not calling the tool — entirely uncounted, and an emergency nudge
+//     then repeats on every request forever.
+//
+// Callers hold the lock.
+func (s *Session) notePriorTurnOutcome(msgs []llm.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	last := msgs[len(msgs)-1]
+	if isRealUserTurn(last) {
+		s.attempts = 0
+		s.suppressedAtTokens = 0
+		s.nudgedLastTurn = false
+		return
+	}
+	if s.nudgedLastTurn && !lastAssistantCalledCompress(msgs) {
+		s.noteFailedAttempt()
+		s.nudgedLastTurn = false
+	}
+}
+
+// isRealUserTurn distinguishes a person speaking from a packaged tool result.
+//
+// Norma carries tool results in Role: user messages, so the role alone says
+// nothing; the absence of any tool_result block is what marks a real turn.
+func isRealUserTurn(m llm.Message) bool {
+	if m.Role != llm.RoleUser {
+		return false
+	}
+	for _, b := range m.Content {
+		if b.Type == llm.BlockToolResult {
+			return false
+		}
+	}
+	return len(m.Content) > 0
+}
+
+// lastAssistantCalledCompress reports whether the most recent assistant message
+// invoked Compress.
+func lastAssistantCalledCompress(msgs []llm.Message) bool {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != llm.RoleAssistant {
+			continue
+		}
+		for _, b := range msgs[i].Content {
+			if b.Type == llm.BlockToolUse && b.Name == noa.CompressToolName {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // resolveTokenCount decides what this turn's context size is.

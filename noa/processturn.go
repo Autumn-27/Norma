@@ -76,12 +76,21 @@ func ProcessTurn(in ProcessTurnInput) ProcessTurnResult {
 
 // pipelineNodes is the per-turn projection, in order.
 //
-// The later stages land in M3/M4; the first three are what make the view
-// correct, and the rest only make it smaller or louder.
+// The order encodes dependencies, not preference:
+//
+//	assign-refs          refs must exist before anything can address a message
+//	sync-blocks          block liveness before prune decides what to hide
+//	prune                the view must be final before it is measured
+//	hide-compress-calls  trims history that prune left behind
+//	emergency-truncate   runs BEFORE the nudge so the nudge can report it
+//	nudge-inject         appends to a view nothing else will touch
 func pipelineNodes() []PipelineNode {
 	return []PipelineNode{
 		assignRefsNode(),
 		syncBlocksNode(),
 		pruneNode(),
+		hideCompressCallsNode(),
+		emergencyTruncateNode(),
+		nudgeInjectNode(),
 	}
 }

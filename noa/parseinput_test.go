@@ -218,3 +218,19 @@ func TestTailRepairRejectsWellFormedInput(t *testing.T) {
 		t.Fatal("tailRepair claimed to repair well-formed JSON")
 	}
 }
+
+// An empty content list is a well-formed call that asks for nothing. Treating
+// it as a parse failure would count it against the failure ladder and punish a
+// model that correctly determined there was nothing to compress.
+func TestParseCompressArgsEmptyContentIsNotAFailure(t *testing.T) {
+	r := parse(`{"content":[]}`)
+	if !r.Diagnostics.Ok {
+		t.Fatalf("diagnostics = %+v, want an empty list to parse cleanly", r.Diagnostics)
+	}
+	if len(r.Ranges) != 0 {
+		t.Fatalf("Ranges = %+v, want none", r.Ranges)
+	}
+	if r.Diagnostics.Kind != ParseOK {
+		t.Fatalf("kind = %s, want %s", r.Diagnostics.Kind, ParseOK)
+	}
+}

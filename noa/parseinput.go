@@ -113,10 +113,13 @@ func ParseCompressArgs(raw []byte) CompressParseResult {
 	}
 
 	res.Ranges = entriesToRanges(entries, res.TopLevelTopic, res.SummaryMaxChars, d)
-	if len(res.Ranges) == 0 {
+	if len(res.Ranges) == 0 && d.InvalidItems > 0 {
+		// Entries were present but none were usable — a malformed call.
 		d.Kind = ParseNoValidRanges
 		return res
 	}
+	// An empty content list parses cleanly; it simply asks for nothing. Treating
+	// it as a failure would punish a well-formed call that had nothing to do.
 	d.Kind = ParseOK
 	d.Ok = true
 	return res
