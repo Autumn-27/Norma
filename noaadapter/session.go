@@ -3,6 +3,7 @@ package noaadapter
 import (
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,6 +24,11 @@ type Options struct {
 	Config *noa.Config
 	// ModelContextLimit sizes the default config when Config is nil.
 	ModelContextLimit int
+	// ParentSessionIDs are ancestors to inherit a ledger from when this session
+	// has none of its own, nearest first. A fork, a subagent, or a transcript
+	// copied without its sidecar would otherwise start from zero and re-compress
+	// everything the ancestor already did. At most maxInheritDepth are tried.
+	ParentSessionIDs []string
 	// OnWarn receives non-fatal diagnostics. noa writes nothing to stdout or
 	// stderr on its own.
 	OnWarn func(string)
@@ -70,6 +76,14 @@ type Session struct {
 	// emergencyFloor, when non-zero, forces the view to build under this ceiling
 	// after a prompt-too-long error taught us the real window.
 	emergencyFloor int
+	// deadRange refuses a range set the model keeps resubmitting.
+	deadRange *DeadRangeTracker
+	// lastCompressAt is Stats.CompressionCount at the last successful
+	// compression, used to spot a stale provider token anchor.
+	lastCompressAt int
+	// providerTokensAt is the compression count when providerTokens was
+	// reported, so a figure that predates a compression can be recognised.
+	providerTokensAt int
 
 	cfg      noa.Config
 	store    *StateStore
@@ -97,12 +111,13 @@ func newSession(o Options) (*Session, error) {
 
 	root := filepath.Join(o.ArchiveBaseDir, o.SessionID)
 	s := &Session{
-		cfg:      cfg,
-		store:    NewStateStore(root),
-		archiver: NewFileArchiver(root),
-		root:     root,
-		now:      now,
-		onWarn:   o.OnWarn,
+		cfg:       cfg,
+		store:     NewStateStore(root),
+		archiver:  NewFileArchiver(root),
+		root:      root,
+		now:       now,
+		onWarn:    o.OnWarn,
+		deadRange: NewDeadRangeTracker(),
 	}
 	for _, w := range noa.ValidateConfig(cfg) {
 		s.warn("config: " + w)
@@ -114,9 +129,19 @@ func newSession(o Options) (*Session, error) {
 		s.warn("state: " + err.Error() + " — starting from an empty state")
 		st = noa.CreateInitialState(o.SessionID, root)
 	}
+	if len(st.Blocks) == 0 && len(o.ParentSessionIDs) > 0 {
+		if inherited, from, ok := InheritState(InheritOptions{
+			ArchiveBaseDir: o.ArchiveBaseDir, SessionID: o.SessionID, ParentIDs: o.ParentSessionIDs,
+		}); ok {
+			s.warn("inherited " + itoa(len(inherited.Blocks)) + " block(s) from session " + from)
+			st = inherited
+		}
+	}
 	s.state = st
 	return s, nil
 }
+
+func itoa(n int) string { return strconv.Itoa(n) }
 
 func (s *Session) warn(msg string) {
 	if s.onWarn != nil {
@@ -286,6 +311,13 @@ func (s *Session) resolveTokenCount(cores []noa.CoreMessage) int {
 	if p <= 0 {
 		return est
 	}
+	// Floor-stale: the provider figure was reported before the most recent
+	// compression, so it describes a context that no longer exists. Trusting it
+	// would keep the pressure ladder pinned at the pre-compression size and
+	// re-trigger an emergency the model already resolved.
+	if s.providerTokensAt < s.lastCompressAt {
+		return est
+	}
 	drift := p - est
 	if drift < 0 {
 		drift = -drift
@@ -329,6 +361,9 @@ func (s *Session) applyCompression(ranges []noa.CompressRange, callID string) no
 		s.state = res.State
 		s.attempts = 0
 		s.suppressedAtTokens = 0
+		s.lastCompressAt = s.state.Stats.CompressionCount
+		// The view changed, so a range that was dead before may not be now.
+		s.deadRange.Reset()
 		if err := s.store.Save(s.state); err != nil {
 			// The compression itself succeeded and the archives are on disk;
 			// losing the state file costs a rebuild, not data.
@@ -336,8 +371,16 @@ func (s *Session) applyCompression(ranges []noa.CompressRange, callID string) no
 		}
 	} else {
 		s.noteFailedAttempt()
+		s.deadRange.Record(ranges)
 	}
 	return res
+}
+
+// checkDeadRange refuses a range set the model keeps resubmitting.
+func (s *Session) checkDeadRange(ranges []noa.CompressRange) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deadRange.Check(ranges, s.state)
 }
 
 // recordParseFailure counts arguments that could not be parsed at all.
@@ -366,6 +409,7 @@ func (s *Session) noteProviderTokens(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.providerTokens = n
+	s.providerTokensAt = s.state.Stats.CompressionCount
 }
 
 // setEmergencyFloor arms or clears the post-overflow ceiling.

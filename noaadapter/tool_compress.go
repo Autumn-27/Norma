@@ -49,6 +49,13 @@ func runCompress(sess *Session, input json.RawMessage, tc *tool.ToolContext) (to
 		return textResult(noa.NoRangesMessage), nil
 	}
 
+	// A range set that has already failed twice will fail identically again;
+	// refusing it outright costs one short message instead of a whole turn.
+	if refusal := sess.checkDeadRange(parsed.Ranges); refusal != "" {
+		sess.recordParseFailure()
+		return errorResult(refusal), nil
+	}
+
 	callID := ""
 	if tc != nil {
 		callID = tc.ToolUseID
