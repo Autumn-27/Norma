@@ -20,8 +20,12 @@ type ProgressInfo struct {
 
 // ToolContext carries per-call execution state into a tool.
 type ToolContext struct {
-	WorkingDir     string
-	AgentID        string
+	WorkingDir string
+	AgentID    string
+	// ToolUseID is the id of the tool_use block this call answers. Tools that
+	// need to refer back to their own call in the conversation — to anchor
+	// something to it, or to recognise it later — read it here.
+	ToolUseID      string
 	MaxOutputChars int
 	// OutputDir, when set, makes oversized tool output spill to a file there
 	// (full content preserved) instead of being discarded by truncation; the

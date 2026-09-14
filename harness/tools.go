@@ -68,6 +68,7 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 	tc := &tool.ToolContext{
 		WorkingDir:     l.in.WorkingDir,
 		AgentID:        l.in.AgentID,
+		ToolUseID:      use.ID,
 		Emit:           emitProgress,
 		OutputDir:      l.in.ToolOutputDir,
 		MaxOutputChars: l.in.MaxToolOutputChars,

@@ -1,0 +1,274 @@
+package noaadapter
+
+import (
+	"errors"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/noa"
+)
+
+// Options configures one noa-managed session.
+type Options struct {
+	// ArchiveBaseDir is where archives and state live. REQUIRED: noa refuses to
+	// guess. The archive is the only route back to compressed originals, so
+	// where it lands must be the host's explicit decision — never a silent
+	// fallback to a temp directory that may be swept away.
+	ArchiveBaseDir string
+	// SessionID names the subdirectory under ArchiveBaseDir.
+	SessionID string
+	// Config overrides the defaults; the zero value means DefaultConfig.
+	Config *noa.Config
+	// ModelContextLimit sizes the default config when Config is nil.
+	ModelContextLimit int
+	// OnWarn receives non-fatal diagnostics. noa writes nothing to stdout or
+	// stderr on its own.
+	OnWarn func(string)
+	// Now overrides the clock, for tests.
+	Now func() time.Time
+}
+
+// ErrNoArchiveDir is returned when ArchiveBaseDir is empty.
+var ErrNoArchiveDir = errors.New("noaadapter: ArchiveBaseDir is required — compression must not run without a durable place for the originals")
+
+// Session is the state the compactor and the Compress tool share.
+//
+// They are two entry points into one system and must see the same data:
+//
+//   - state: the tool creates blocks, the view hides them. If they diverge, the
+//     model compresses into a void — the panel reports success and the next
+//     request still carries the full history.
+//   - lastView: the refs the model used were resolved against the array the
+//     view produced. Re-deriving it in the tool could yield a different array
+//     and therefore a misaligned range.
+//   - attempts: the tool counts failures, the view reads the count to decide
+//     whether to keep nudging.
+type Session struct {
+	mu sync.Mutex
+
+	state    noa.CompressionState
+	lastView []noa.CoreMessage
+	sidecar  *Sidecar
+
+	// lastTokenCount is the measured size of the context this turn.
+	lastTokenCount int
+	// attempts counts consecutive failed or ignored compression prompts.
+	attempts int
+	// suppressedAtTokens records where suppression began, so it can lift once
+	// the context has grown enough for the situation to have changed.
+	suppressedAtTokens int
+	// nudgedLastTurn lets the view notice a nudge that was ignored outright.
+	nudgedLastTurn bool
+	// lastTruncatedCount is how many tool results were mechanically shortened.
+	lastTruncatedCount int
+	// providerTokens is the input size the provider last reported. It is
+	// authoritative where available: a local estimate can drift, and the whole
+	// pressure ladder keys off this number.
+	providerTokens int
+	// emergencyFloor, when non-zero, forces the view to build under this ceiling
+	// after a prompt-too-long error taught us the real window.
+	emergencyFloor int
+
+	cfg      noa.Config
+	store    *StateStore
+	archiver noa.Archiver
+	root     string
+	now      func() time.Time
+	onWarn   func(string)
+}
+
+func newSession(o Options) (*Session, error) {
+	if o.ArchiveBaseDir == "" {
+		return nil, ErrNoArchiveDir
+	}
+	cfg := noa.DefaultConfig(o.ModelContextLimit)
+	if o.Config != nil {
+		cfg = *o.Config
+	}
+	if cfg.ModelContextLimit <= 0 {
+		cfg.ModelContextLimit = 200000
+	}
+	now := o.Now
+	if now == nil {
+		now = time.Now
+	}
+
+	root := filepath.Join(o.ArchiveBaseDir, o.SessionID)
+	s := &Session{
+		cfg:      cfg,
+		store:    NewStateStore(root),
+		archiver: NewFileArchiver(root),
+		root:     root,
+		now:      now,
+		onWarn:   o.OnWarn,
+	}
+	for _, w := range noa.ValidateConfig(cfg) {
+		s.warn("config: " + w)
+	}
+	st, err := s.store.Load(o.SessionID, root)
+	if err != nil {
+		// A damaged state file is recoverable: blocks can be replayed from the
+		// transcript. Starting fresh beats refusing to run.
+		s.warn("state: " + err.Error() + " — starting from an empty state")
+		st = noa.CreateInitialState(o.SessionID, root)
+	}
+	s.state = st
+	return s, nil
+}
+
+func (s *Session) warn(msg string) {
+	if s.onWarn != nil {
+		s.onWarn("noa: " + msg)
+	}
+}
+
+// ArchiveRoot is where this session's archives and state live.
+func (s *Session) ArchiveRoot() string { return s.root }
+
+// Config returns the resolved configuration.
+func (s *Session) Config() noa.Config { return s.cfg }
+
+// State returns a copy of the current compression state.
+func (s *Session) State() noa.CompressionState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return noa.CloneState(s.state)
+}
+
+// View projects the history for one request.
+//
+// Pure with respect to msgs: the returned slice is for this request only and is
+// never written back. Message identity is a content hash, so writing a tagged
+// or truncated body back would change every id derived from it.
+func (s *Session) View(msgs []llm.Message) []llm.Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cores, sc := Project(msgs)
+	tokens := s.resolveTokenCount(cores)
+	s.lastTokenCount = tokens
+
+	res := noa.ProcessTurn(noa.ProcessTurnInput{
+		Messages:   cores,
+		State:      s.state,
+		Config:     s.cfg,
+		TokenCount: tokens,
+	})
+	s.state = res.State
+	s.lastView = res.Messages
+	s.sidecar = sc
+	s.lastTruncatedCount = res.TruncatedCount
+
+	return Reassemble(res.Messages, msgs, sc, ReassembleOptions{State: &s.state, Tag: true})
+}
+
+// resolveTokenCount decides what this turn's context size is.
+//
+// The provider's reported input size wins when it is close to the local
+// estimate; a large divergence means the reported figure describes a different
+// array than the one being built (it lags a compression, or counts content
+// prune removes), and the estimate of the SENT view is the honest number.
+// Callers hold the lock.
+func (s *Session) resolveTokenCount(cores []noa.CoreMessage) int {
+	est := estimateCoreTokens(cores)
+	p := s.providerTokens
+	if p <= 0 {
+		return est
+	}
+	drift := p - est
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > max(1000, est/10) {
+		return est
+	}
+	return p
+}
+
+// estimateCoreTokens sizes the projected view.
+//
+// Estimating the SENT view rather than raw history matters: the raw array still
+// contains everything prune will hide, so counting it would pin the figure high
+// forever and drive compression that reclaims nothing.
+func estimateCoreTokens(cores []noa.CoreMessage) int {
+	total := 0
+	for _, c := range cores {
+		total += noa.DefaultCountTokens(c.Text)
+	}
+	return total
+}
+
+// applyCompression runs one Compress call against the shared state.
+func (s *Session) applyCompression(ranges []noa.CompressRange, callID string) noa.ApplyResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.now()
+	res := noa.ApplyCompression(noa.ApplyInput{
+		Ranges:    ranges,
+		Messages:  s.lastView,
+		State:     s.state,
+		Config:    s.cfg,
+		CallID:    callID,
+		Archiver:  s.archiver,
+		CreatedAt: now.Format(time.RFC3339),
+		Now:       now.Unix(),
+	})
+	if len(res.BlocksCreated) > 0 {
+		s.state = res.State
+		s.attempts = 0
+		s.suppressedAtTokens = 0
+		if err := s.store.Save(s.state); err != nil {
+			// The compression itself succeeded and the archives are on disk;
+			// losing the state file costs a rebuild, not data.
+			s.warn("state save failed: " + err.Error())
+		}
+	} else {
+		s.noteFailedAttempt()
+	}
+	return res
+}
+
+// recordParseFailure counts arguments that could not be parsed at all.
+//
+// Malformed arguments count against the same ladder as an empty result: from
+// the context's point of view nothing was reclaimed either way, and a model
+// stuck producing unusable JSON loops just as expensively as one producing
+// unusable ranges.
+func (s *Session) recordParseFailure() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noteFailedAttempt()
+}
+
+// noteFailedAttempt records an attempt that reclaimed nothing. Callers hold the
+// lock.
+func (s *Session) noteFailedAttempt() {
+	s.attempts++
+	if s.attempts == s.cfg.MaxCompressAttempts {
+		s.suppressedAtTokens = s.lastTokenCount
+	}
+}
+
+// noteProviderTokens records the input size the provider reported.
+func (s *Session) noteProviderTokens(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.providerTokens = n
+}
+
+// setEmergencyFloor arms or clears the post-overflow ceiling.
+func (s *Session) setEmergencyFloor(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.emergencyFloor = n
+}
+
+// tokensBefore reports the current view's size, for the panel headline.
+func (s *Session) tokensBefore() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTokenCount
+}
