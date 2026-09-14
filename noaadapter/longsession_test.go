@@ -66,8 +66,27 @@ func (a *simAgent) work(outputChars int) {
 // rangeLineRE matches the compressible rows of a rendered nudge.
 var rangeLineRE = regexp.MustCompile(`^\s{2}(m\d{5})–(m\d{5})\s+\d+ msgs\s+\S+ \[tool`)
 
-// blockLineRE matches the block map entries of a rendered nudge.
+// blockLineRE matches the block map entries of a rendered nudge, which read
+// `b3(T2)=m00044–m00097`.
 var blockLineRE = regexp.MustCompile(`(b\d+)\(T(\d+)\)=(m\d{5})–(m\d{5})`)
+
+// tierTargetLineRE matches the target list a tier-2/3 nudge carries, which is a
+// DIFFERENT shape from the block map: `  b7  4 msgs  2.0K→79  "work batch"`
+// (FormatTierTargetBlocks). Reading a tier nudge with the block-map pattern
+// silently finds nothing and the agent does nothing — which is exactly the way
+// a real model would fail if the two formats were as easy to confuse.
+var tierTargetLineRE = regexp.MustCompile(`^\s{2}(b\d+)\s+\d+ msgs\s`)
+
+// tierTargets pulls the block ids a tier nudge is asking to consolidate.
+func tierTargets(nudge string) []string {
+	var out []string
+	for _, line := range strings.Split(nudge, "\n") {
+		if m := tierTargetLineRE.FindStringSubmatch(line); m != nil {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
 
 // observe renders the view and reacts to whatever the context manager says.
 func (a *simAgent) observe() []llm.Message {
@@ -95,10 +114,9 @@ func (a *simAgent) act(nudge string) {
 	var entries []map[string]any
 
 	if strings.Contains(nudge, "DISTILLATION TRIGGER") || strings.Contains(nudge, "CONDENSATION TRIGGER") {
-		blocks := blockLineRE.FindAllStringSubmatch(nudge, -1)
-		if len(blocks) >= 2 {
+		if targets := tierTargets(nudge); len(targets) >= 2 {
 			entries = append(entries, map[string]any{
-				"startId": blocks[0][1], "endId": blocks[len(blocks)-1][1],
+				"startId": targets[0], "endId": targets[len(targets)-1],
 				"summary": a.summary("consolidated blocks"), "topic": "consolidation",
 			})
 		}
