@@ -49,12 +49,24 @@ func (c *Compactor) IsOverflow(err error) bool {
 // 413 → retry → 413 loop, which is worse than a clean failure. So the view is
 // rebuilt and measured, and false is returned if it did not shrink.
 func (c *Compactor) Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Message, bool) {
-	before := c.sess.tokensBefore()
+	// Compare against the array the provider actually rejected, not the raw
+	// projection. The projection is always larger than the sent view, so
+	// measuring against it would show progress on every attempt and never admit
+	// that arming changed nothing.
+	before := c.sess.sentTokens()
+
 	c.overflow.arm(c.sess.Config().ModelContextLimit)
-	c.sess.setEmergencyFloor(c.overflow.armedFloor())
+	floor := c.overflow.armedFloor()
+	c.sess.setEmergencyFloor(floor)
 
 	after := estimateMessages(c.View(ctx, msgs))
-	if before > 0 && after >= before {
+
+	shrank := before == 0 || after < before
+	fits := floor == 0 || after <= floor
+	if !shrank || !fits {
+		// Nothing more to give. Returning true here would promise a smaller
+		// request that is not smaller, and the loop would retry into the same
+		// rejection indefinitely; a clean prompt-too-long is the better outcome.
 		c.sess.setEmergencyFloor(0)
 		c.overflow.disarm()
 		return msgs, false

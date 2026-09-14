@@ -292,14 +292,33 @@ func TestReassembleWithoutTagging(t *testing.T) {
 
 func TestStripRefTag(t *testing.T) {
 	cases := map[string]string{
-		"body\n<noa-ref id=\"m00001\" tokens=\"5\"/>":                 "body",
-		"<noa-ref id=\"m00001\" tokens=\"5\"/>\nbody":                 "body",
+		"body\n<noa-ref id=\"m00001\" tokens=\"5\"/>": "body",
+		// Only the trailing form is ever produced, so only it is stripped; a
+		// leading one is left alone rather than risk eating user content that
+		// opens with tag-shaped text.
+		"<noa-ref id=\"m00001\" tokens=\"5\"/>\nbody":                 "<noa-ref id=\"m00001\" tokens=\"5\"/>\nbody",
 		"body with no tag":                                            "body with no tag",
 		"body\n<noa-ref id=\"m00042\" tokens=\"1.2K\" src=\"Read\"/>": "body",
 	}
 	for in, want := range cases {
 		if got := StripRefTag(in); got != want {
 			t.Errorf("StripRefTag(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The real contract: whatever Reassemble appends, Project removes — exactly.
+func TestTagAppendStripRoundTrip(t *testing.T) {
+	for _, body := range []string{
+		"plain body",
+		"body\nwith newlines\n",
+		"中文正文 🔐",
+		"",
+		"body that mentions <noa-ref> in passing",
+	} {
+		tagged := AppendRefTag(body, RefTag("m00042", noa.CoreMessage{ContentType: noa.CTText}, 120))
+		if got := StripRefTag(tagged); got != body {
+			t.Errorf("round trip lost content:\n  body:   %q\n  tagged: %q\n  back:   %q", body, tagged, got)
 		}
 	}
 }

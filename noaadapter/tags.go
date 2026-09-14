@@ -24,19 +24,27 @@ import (
 // name alone would let a <noa-ref> appearing inside a file the agent read be
 // stripped out of that file's content.
 var (
-	leadingTagRE  = regexp.MustCompile(`^<noa-ref\s+id="m\d{5}"[^>]*/>\s?\n?`)
-	trailingTagRE = regexp.MustCompile(`\n*<noa-ref\s+id="m\d{5}"[^>]*/>\s*$`)
+	// Only the TRAILING form is stripped, because only the trailing form is ever
+	// produced (see AppendRefTag). Stripping a leading one as well would defend
+	// against a shape noa never emits, at the cost of silently eating a user
+	// message that legitimately opens with tag-shaped text — a transcript
+	// pasted back in, say. A silent corruption of real content is worse than the
+	// theoretical id drift it would prevent, and that drift is at least visible
+	// as a dangling ref.
+	// Exactly ONE separator is consumed, matching the single newline
+	// AppendRefTag inserts. A greedy `\n*` would also swallow a newline the body
+	// itself ended with, so tagging and stripping would not round-trip and the
+	// content would quietly change.
+	trailingTagRE = regexp.MustCompile(`(?:^|\n)<noa-ref\s+id="m\d{5}"[^>]*/>\s*$`)
 	anyRefTagRE   = regexp.MustCompile(`<noa-ref\s+id="(m\d{5})"[^>]*/>`)
 )
 
-// StripRefTag removes a ref tag from either end of a body.
+// StripRefTag removes the ref tag from the end of a body.
 //
 // Projection calls this before hashing: a tag inside the identity would make
-// the id drift every turn.
+// the id drift every turn the tag is re-rendered.
 func StripRefTag(s string) string {
-	s = leadingTagRE.ReplaceAllString(s, "")
-	s = trailingTagRE.ReplaceAllString(s, "")
-	return s
+	return trailingTagRE.ReplaceAllString(s, "")
 }
 
 // MessageRef reads a ref back out of a message's text, if it carries one.

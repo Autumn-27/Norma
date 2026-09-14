@@ -58,8 +58,14 @@ type Session struct {
 	lastView []noa.CoreMessage
 	sidecar  *Sidecar
 
-	// lastTokenCount is the measured size of the context this turn.
+	// lastTokenCount is the measured size of the PROJECTED history this turn,
+	// before prune and truncation.
 	lastTokenCount int
+	// lastSentTokens is the size of the array actually handed to the provider.
+	// Overflow recovery compares against this, not the raw projection: the
+	// projection is always larger, so comparing to it would report progress on
+	// every attempt and never admit defeat.
+	lastSentTokens int
 	// attempts counts consecutive failed or ignored compression prompts.
 	attempts int
 	// suppressedAtTokens records where suppression began, so it can lift once
@@ -210,7 +216,9 @@ func (s *Session) View(msgs []llm.Message) []llm.Message {
 	// the array the model actually sees — nudge included.
 	s.lastView = view
 
-	return Reassemble(view, msgs, sc, ReassembleOptions{State: &s.state, Tag: true})
+	out := Reassemble(view, msgs, sc, ReassembleOptions{State: &s.state, Tag: true})
+	s.lastSentTokens = estimateMessages(out)
+	return out
 }
 
 // nudgeAllowed gates injection on the failure ladder.
@@ -424,4 +432,11 @@ func (s *Session) tokensBefore() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastTokenCount
+}
+
+// sentTokens reports the size of the last array handed to the provider.
+func (s *Session) sentTokens() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastSentTokens
 }

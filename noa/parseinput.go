@@ -23,6 +23,14 @@ const (
 )
 
 // CompressParseDiagnostics records how the arguments arrived.
+//
+// Ok and Kind answer different questions and are both needed. Ok is "were
+// usable ranges recovered" — the only thing a caller should branch on. Kind is
+// "how did they arrive", which keeps the malformation visible in logs even when
+// the recovery succeeded. A salvaged parse is correctly both Ok and
+// ParseTruncated.
+//
+// Invariant: !Ok implies no ranges.
 type CompressParseDiagnostics struct {
 	Ok             bool
 	Kind           CompressParseKind
