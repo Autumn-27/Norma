@@ -20,8 +20,12 @@ type ProgressInfo struct {
 
 // ToolContext carries per-call execution state into a tool.
 type ToolContext struct {
-	WorkingDir     string
-	AgentID        string
+	WorkingDir string
+	AgentID    string
+	// ToolUseID is the id of the tool_use block this call answers. Tools that
+	// need to refer back to their own call in the conversation — to anchor
+	// something to it, or to recognise it later — read it here.
+	ToolUseID      string
 	MaxOutputChars int
 	// OutputDir, when set, makes oversized tool output spill to a file there
 	// (full content preserved) instead of being discarded by truncation; the
@@ -100,6 +104,20 @@ type Spec struct {
 	Concurrent  func(json.RawMessage) bool
 	Permissions func(ctx context.Context, input json.RawMessage, pc permission.Context) permission.Decision
 	Run         func(ctx context.Context, input json.RawMessage, tc *ToolContext) (Result, error)
+
+	// RawInput hands Run whatever the model produced, skipping the schema check
+	// the harness otherwise applies first.
+	//
+	// Schema stays required and is still advertised to the model — the two are
+	// separate jobs. Schema tells the model what to send; validation decides what
+	// gets through. A tool that repairs malformed arguments itself needs the
+	// first and is defeated by the second: a truncated or fence-wrapped call is
+	// not valid JSON, so it would be rejected before Run ever saw it, and the
+	// repair could never run.
+	//
+	// Only set this on a tool that treats its input as untrusted bytes and
+	// answers every shape with a Result rather than an error.
+	RawInput bool
 }
 
 // Build constructs a CoreTool from a Spec, applying fail-closed defaults.
@@ -111,6 +129,13 @@ func (t *builtTool) Name() string                { return t.spec.Name }
 func (t *builtTool) Description() string         { return t.spec.Description }
 func (t *builtTool) Prompt() string              { return t.spec.Prompt }
 func (t *builtTool) InputSchema() map[string]any { return t.spec.Schema }
+
+// AcceptsRawInput reports whether this tool parses its own arguments.
+//
+// Deliberately not on CoreTool: that interface is public, and adding a method
+// would break every host implementing it. The harness asks for it with an
+// optional type assertion, the same way it discovers ContextView.
+func (t *builtTool) AcceptsRawInput() bool { return t.spec.RawInput }
 
 func (t *builtTool) IsReadOnly(in json.RawMessage) bool {
 	if t.spec.ReadOnly == nil {
