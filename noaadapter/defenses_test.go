@@ -136,7 +136,7 @@ func TestProviderTokensUsedWhenCurrent(t *testing.T) {
 	sess.mu.Lock()
 	cores, _ := Project(msgs)
 	est := estimateCoreTokens(cores)
-	sess.providerTokens = est + 100 // within the drift tolerance
+	sess.providerTokens = est + 100 // authoritative and current, so it is adopted
 	sess.providerTokensAt = 0
 	sess.lastCompressAt = 0
 	got := sess.resolveTokenCount(cores)
@@ -147,23 +147,33 @@ func TestProviderTokensUsedWhenCurrent(t *testing.T) {
 	}
 }
 
-// A figure far from the estimate describes a different array than the one being
-// built, so the estimate of the SENT view is the honest number.
-func TestProviderTokensRejectedOnLargeDrift(t *testing.T) {
+// A provider figure well above the estimate is NOT discarded as drift: it is
+// authoritative (it describes the array the provider actually received) and it
+// carries overhead the projection omits — the system prompt and tool
+// definitions. So it is applied as a raise-only floor. Discarding it was the
+// accomplice to the raw-history mis-count: once the estimate itself read high
+// the honest provider number was rejected as "drift" on every turn, and nothing
+// could pull the ladder back down (session-847926).
+//
+// The one exception, that a provider figure predating a compression is ignored,
+// is the floor-stale guard, pinned separately by
+// TestProviderAnchorPredatingCompression.
+func TestProviderTokensRaiseTheFloor(t *testing.T) {
 	sess, msgs := pressureSession(t)
 	sess.View(msgs)
 
 	sess.mu.Lock()
 	cores, _ := Project(msgs)
-	est := estimateCoreTokens(cores)
-	sess.providerTokens = est * 10
+	base := estimateProjectedTokens(cores, sess.state, sess.cfg)
+	sess.providerTokens = base * 10
 	sess.providerTokensAt = 0
 	sess.lastCompressAt = 0
 	got := sess.resolveTokenCount(cores)
 	sess.mu.Unlock()
 
-	if got != est {
-		t.Fatalf("token count = %d, want the local estimate %d on large drift", got, est)
+	if got != base*10 {
+		t.Fatalf("token count = %d, want the provider figure %d — it is authoritative and "+
+			"must raise the count, not be thrown away as drift", got, base*10)
 	}
 }
 
