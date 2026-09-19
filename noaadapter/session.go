@@ -308,13 +308,24 @@ func lastAssistantCalledCompress(msgs []llm.Message) bool {
 
 // resolveTokenCount decides what this turn's context size is.
 //
-// The provider's reported input size wins when it is close to the local
-// estimate; a large divergence means the reported figure describes a different
-// array than the one being built (it lags a compression, or counts content
-// prune removes), and the estimate of the SENT view is the honest number.
-// Callers hold the lock.
+// The base is the size of the PRUNED view — the request that will actually be
+// sent — not the raw history. Counting the raw history is the pressure ladder's
+// original sin: it holds everything prune replaces with a summary and every
+// orphan prune strips, so the figure only ever grows and a compression that
+// removes tens of thousands of tokens from the request leaves it unchanged. The
+// ladder then pins to the pressure band forever and nudges on every turn (the
+// session-847926 compression loop). ProjectedTokenCount measures the pruned
+// view instead.
+//
+// The provider's reported input size is then applied as a raise-only FLOOR, not
+// as something the estimate can outvote. It is authoritative — it describes the
+// array the provider actually received — and it includes overhead the
+// projection omits (system prompt, tool definitions). A gap between the two
+// means the estimate is MISSING real tokens, so the safe response is to raise
+// to the provider's number, never to discard it as "drift". Callers hold the
+// lock.
 func (s *Session) resolveTokenCount(cores []noa.CoreMessage) int {
-	est := estimateCoreTokens(cores)
+	est := estimateProjectedTokens(cores, s.state, s.cfg)
 	p := s.providerTokens
 	if p <= 0 {
 		return est
@@ -326,21 +337,23 @@ func (s *Session) resolveTokenCount(cores []noa.CoreMessage) int {
 	if s.providerTokensAt < s.lastCompressAt {
 		return est
 	}
-	drift := p - est
-	if drift < 0 {
-		drift = -drift
-	}
-	if drift > max(1000, est/10) {
-		return est
-	}
-	return p
+	return max(est, p)
 }
 
-// estimateCoreTokens sizes the projected view.
+// estimateProjectedTokens sizes the view that will actually be SENT: the pruned
+// projection, with covered content hidden and orphans stripped.
 //
-// Estimating the SENT view rather than raw history matters: the raw array still
-// contains everything prune will hide, so counting it would pin the figure high
-// forever and drive compression that reclaims nothing.
+// Sizing the sent view rather than raw history is the whole point — the raw
+// array still contains everything prune removes, so counting it pins the figure
+// high forever and drives compression that reclaims nothing.
+func estimateProjectedTokens(cores []noa.CoreMessage, state noa.CompressionState, cfg noa.Config) int {
+	return noa.ProjectedTokenCount(cores, state, cfg, nil)
+}
+
+// estimateCoreTokens sums the RAW projection, ignoring what prune would hide.
+// Use it only where the raw history size is genuinely the question (e.g.
+// measuring how much emergency-truncate removed); the pressure ladder must use
+// estimateProjectedTokens instead.
 func estimateCoreTokens(cores []noa.CoreMessage) int {
 	total := 0
 	for _, c := range cores {
