@@ -69,6 +69,22 @@ func prune(io NodeIO, _ PipelineContext) NodeIO {
 		return io
 	}
 
+	// Reconcile the coverage set for integrity BEFORE anything is dropped.
+	// CoveredMessageIDs is the union over every active block's effective span, so
+	// it can slice a unit that a single block's compress-time turn-integrity check
+	// (run on that block's DIRECT ids) never saw whole — across two blocks, or
+	// after a tier promotion changed a block's effective coverage. Two units must
+	// stay wholly in or wholly out of coverage, or the rebuilt request is rejected:
+	//   - a thinking turn — an assistant act kept while its reasoning run is hidden
+	//     leaves a tool_calls message with no reasoning_content, which strict
+	//     thinking providers 400 on;
+	//   - a Compress exchange — its call is exempt from orphan stripping, so a
+	//     half-covered pair leaves an assistant tool_calls with no tool result.
+	// Both only ever un-cover messages, so neither can create a new split, and a
+	// single pass reaches a fixed point.
+	keepReasoningForVisibleTurns(io.Messages, covered)
+	keepCompressPairsWhole(io.Messages, covered)
+
 	indexOf := make(map[string]int, len(io.Messages))
 	for i, m := range io.Messages {
 		if m.ID != "" {
@@ -234,6 +250,80 @@ func stripOrphanedReasoning(msgs []CoreMessage) []CoreMessage {
 		}
 	}
 	return out
+}
+
+// keepReasoningForVisibleTurns un-covers the reasoning run of any turn that
+// keeps a visible assistant act.
+//
+// A thinking provider validates that every assistant message replaying tool_calls
+// carries the reasoning_content it was produced with. If coverage hides the run
+// while an act of the same turn survives, the rebuilt assistant message loses
+// that content and the request 400s ("reasoning_content ... must be passed back").
+// Widening the other way — hiding the act too — would drop work the model still
+// needs, so the run is freed to stay beside its act, not the act cut to match a
+// hidden run.
+//
+// A turn whose acts are ALL covered is left untouched: its reasoning stays
+// covered and, with nothing visible pointing back to it, stripOrphanedReasoning
+// removes it later.
+func keepReasoningForVisibleTurns(msgs []CoreMessage, covered map[string]bool) {
+	for _, g := range ComputeTurnGroups(msgs) {
+		if len(g.ReasoningIdx) == 0 {
+			continue
+		}
+		actVisible := false
+		for _, i := range g.ActIdx {
+			if !covered[msgs[i].ID] {
+				actVisible = true
+				break
+			}
+		}
+		if !actVisible {
+			continue
+		}
+		for _, i := range g.ReasoningIdx {
+			delete(covered, msgs[i].ID)
+		}
+	}
+}
+
+// keepCompressPairsWhole un-covers both halves of a Compress exchange whenever
+// coverage caught only one of them.
+//
+// AdjustBoundariesForToolPairs deliberately excludes Compress from range
+// widening — it is hard-protected and never itself compressed — so a range
+// boundary can fall between a Compress call and its result and leave the union
+// covering just one side. Because stripOrphanedToolCalls exempts the Compress
+// call, a covered-away result would strand that call as an unpaired tool_calls
+// message, which strict providers reject ("tool_calls must be followed by tool
+// messages"). Freeing both halves keeps the pair intact in the view.
+//
+// A pair with one half missing from msgs entirely cannot be reconciled here; the
+// provider-layer send guard is the final backstop for that.
+func keepCompressPairsWhole(msgs []CoreMessage, covered map[string]bool) {
+	callMsgID := map[string]string{}
+	resultMsgID := map[string]string{}
+	compressCallIDs := map[string]bool{}
+	for _, m := range msgs {
+		switch {
+		case m.ContentType == CTToolCall && m.ToolName == CompressToolName && m.ToolCallID != "":
+			compressCallIDs[m.ToolCallID] = true
+			callMsgID[m.ToolCallID] = m.ID
+		case m.ContentType == CTToolResult && m.ToolCallID != "":
+			resultMsgID[m.ToolCallID] = m.ID
+		}
+	}
+	for tcid := range compressCallIDs {
+		cID, okCall := callMsgID[tcid]
+		rID, okResult := resultMsgID[tcid]
+		if !okCall || !okResult {
+			continue // a missing half — left to the send guard
+		}
+		if covered[cID] != covered[rID] {
+			delete(covered, cID)
+			delete(covered, rID)
+		}
+	}
 }
 
 // isAssistantAct reports whether m is something a reasoning run can belong to.

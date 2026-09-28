@@ -206,6 +206,108 @@ func TestStripOrphanedReasoningHandlesMultipleRuns(t *testing.T) {
 	}
 }
 
+func containsID(msgs []CoreMessage, id string) bool {
+	for _, m := range msgs {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// Issue #174, error 1: a block's effective coverage sliced a thinking turn —
+// the reasoning run went into the summary while its assistant tool-call stayed
+// visible, leaving a tool_calls message with no reasoning_content (a 400 on
+// strict thinking providers). prune must free the reasoning so it stays beside
+// its visible act; the rest of the block still compresses.
+func TestPruneKeepsReasoningWhenActVisible(t *testing.T) {
+	st := CreateInitialState("s", "/tmp")
+	// Block covers an earlier message AND the reasoning run, but NOT the act.
+	st.Blocks = []CompressionBlock{block("b1", 1, "old1", "think1")}
+	msgs := []CoreMessage{
+		msg("u", RoleUser, CTText, "task"),
+		msg("old1", RoleAssistant, CTText, "earlier work"),
+		{ID: "think1", Role: RoleAssistant, ContentType: CTReasoning, Text: "thinking"},
+		{ID: "act1", Role: RoleAssistant, ContentType: CTToolCall, ToolCallID: "t1", ToolName: "Read"},
+		{ID: "res1", Role: RoleTool, ContentType: CTToolResult, ToolCallID: "t1"},
+	}
+	got := pruneWith(msgs, st)
+	want := []string{"u", SummaryMessageID("b1"), "think1", "act1", "res1"}
+	if strings.Join(ids(got), ",") != strings.Join(want, ",") {
+		t.Fatalf("prune = %v, want %v — reasoning must stay beside its visible act", ids(got), want)
+	}
+}
+
+// The counter-case: when the whole turn is covered there is no visible act to
+// protect, so the reasoning stays compressed (and stripOrphanedReasoning removes
+// it). The fix must not over-retain.
+func TestPruneDropsReasoningWhenWholeTurnCovered(t *testing.T) {
+	st := CreateInitialState("s", "/tmp")
+	st.Blocks = []CompressionBlock{block("b1", 1, "think1", "act1", "res1")}
+	msgs := []CoreMessage{
+		msg("u", RoleUser, CTText, "task"),
+		{ID: "think1", Role: RoleAssistant, ContentType: CTReasoning, Text: "thinking"},
+		{ID: "act1", Role: RoleAssistant, ContentType: CTToolCall, ToolCallID: "t1", ToolName: "Read"},
+		{ID: "res1", Role: RoleTool, ContentType: CTToolResult, ToolCallID: "t1"},
+		msg("recent", RoleUser, CTText, "now"),
+	}
+	got := pruneWith(msgs, st)
+	if containsID(got, "think1") {
+		t.Fatalf("prune = %v, want reasoning dropped when its whole turn is covered", ids(got))
+	}
+	want := []string{"u", SummaryMessageID("b1"), "recent"}
+	if strings.Join(ids(got), ",") != strings.Join(want, ",") {
+		t.Fatalf("prune = %v, want %v", ids(got), want)
+	}
+}
+
+// Issue #174, error 2: a range boundary fell between a Compress call and its
+// result (AdjustBoundariesForToolPairs excludes Compress), so coverage caught
+// only the result. Because stripOrphanedToolCalls exempts the Compress call, the
+// result being dropped would strand the call as an unpaired tool_calls message.
+// prune must keep the pair whole.
+func TestPruneKeepsCompressPairWhole(t *testing.T) {
+	st := CreateInitialState("s", "/tmp")
+	// Block covers an earlier message AND the Compress result, but NOT the call.
+	st.Blocks = []CompressionBlock{block("b1", 1, "old1", "cres")}
+	msgs := []CoreMessage{
+		msg("u", RoleUser, CTText, "task"),
+		msg("old1", RoleAssistant, CTText, "earlier work"),
+		{ID: "ccall", Role: RoleAssistant, ContentType: CTToolCall, ToolCallID: "tc", ToolName: CompressToolName},
+		{ID: "cres", Role: RoleTool, ContentType: CTToolResult, ToolCallID: "tc"},
+	}
+	got := pruneWith(msgs, st)
+	if !containsID(got, "ccall") || !containsID(got, "cres") {
+		t.Fatalf("prune = %v, want both halves of the Compress exchange kept", ids(got))
+	}
+}
+
+// keepReasoningForVisibleTurns only ever un-covers, so it cannot manufacture a
+// new split; a direct check on the reconciliation of the coverage set.
+func TestKeepReasoningForVisibleTurnsUnCoversOnly(t *testing.T) {
+	msgs := []CoreMessage{
+		{ID: "think1", Role: RoleAssistant, ContentType: CTReasoning, Text: "t"},
+		{ID: "act1", Role: RoleAssistant, ContentType: CTToolCall, ToolCallID: "t1", ToolName: "Read"},
+	}
+	covered := map[string]bool{"think1": true} // act visible, reasoning hidden
+	keepReasoningForVisibleTurns(msgs, covered)
+	if covered["think1"] {
+		t.Fatalf("reasoning stayed covered while its act is visible")
+	}
+}
+
+func TestKeepCompressPairsWholeFreesHalfCoveredPair(t *testing.T) {
+	msgs := []CoreMessage{
+		{ID: "ccall", Role: RoleAssistant, ContentType: CTToolCall, ToolCallID: "tc", ToolName: CompressToolName},
+		{ID: "cres", Role: RoleTool, ContentType: CTToolResult, ToolCallID: "tc"},
+	}
+	covered := map[string]bool{"cres": true} // only the result caught
+	keepCompressPairsWhole(msgs, covered)
+	if covered["cres"] || covered["ccall"] {
+		t.Fatalf("half-covered Compress pair was not freed: %v", covered)
+	}
+}
+
 func TestIsRenderedSummaryMessage(t *testing.T) {
 	good := CoreMessage{ID: SummaryMessageID("b1"), Role: RoleUser, ContentType: CTText, Text: SummaryHeader + " — topic"}
 	if !isRenderedSummaryMessage(good) {
