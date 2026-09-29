@@ -135,6 +135,78 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 	return out
 }
 
+// reasoningElidedPlaceholder stands in for a thinking turn's reasoning_content
+// when it was lost upstream (context compaction) yet the turn still replays
+// tool_calls. Sending a minimal non-empty value keeps the request valid for
+// providers that only require the field to be present; the real content is
+// preserved by the compaction layer, so this path is a last resort.
+const reasoningElidedPlaceholder = "(reasoning elided by context compaction)"
+
+// sanitizeOpenAIMessages enforces, at the provider boundary, the two structural
+// invariants OpenAI-compatible endpoints validate — regardless of what produced
+// req.Messages (noa compaction, the built-in compactor, or a host that assembled
+// them directly):
+//
+//   - Every assistant tool_call is answered by a following role:tool message,
+//     and every role:tool answers a tool_call still present. A half-pair in
+//     either direction is a 400 ("tool_calls must be followed by tool messages"
+//     / an unexpected tool message).
+//   - In thinking mode, an assistant message replaying tool_calls carries
+//     reasoning_content. If a gap slips through despite the upstream repair, a
+//     minimal placeholder is sent rather than letting a strict provider reject
+//     the bare tool_calls turn.
+//
+// It is a defensive backstop, not the primary repair: the fixes that keep the
+// real content whole upstream should mean the placeholder path never runs. The
+// input slice is mutated in place and also returned.
+func sanitizeOpenAIMessages(msgs []oaMessage, thinking bool) []oaMessage {
+	// Which tool_call ids actually have a role:tool response.
+	responded := map[string]bool{}
+	for _, m := range msgs {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			responded[m.ToolCallID] = true
+		}
+	}
+	// Pass 1: drop unanswered tool_calls from each assistant message.
+	for i := range msgs {
+		if msgs[i].Role != "assistant" || len(msgs[i].ToolCalls) == 0 {
+			continue
+		}
+		kept := make([]oaToolCall, 0, len(msgs[i].ToolCalls))
+		for _, tc := range msgs[i].ToolCalls {
+			if responded[tc.ID] {
+				kept = append(kept, tc)
+			}
+		}
+		msgs[i].ToolCalls = kept
+		if thinking && len(kept) > 0 && msgs[i].ReasoningContent == "" {
+			msgs[i].ReasoningContent = reasoningElidedPlaceholder
+		}
+		// An assistant message must carry content or tool_calls; a turn emptied by
+		// the drop above would serialize to a bare {"role":"assistant"} and 400.
+		if msgs[i].Content == "" && len(msgs[i].ToolCalls) == 0 {
+			msgs[i].Content = "…"
+		}
+	}
+	// Pass 2: drop role:tool messages whose call no longer survives.
+	surviving := map[string]bool{}
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			for _, tc := range m.ToolCalls {
+				surviving[tc.ID] = true
+			}
+		}
+	}
+	out := make([]oaMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Role == "tool" && m.ToolCallID != "" && !surviving[m.ToolCallID] {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 func flattenText(blocks []ContentBlock) string {
 	var s strings.Builder
 	for _, b := range blocks {
@@ -146,9 +218,22 @@ func flattenText(blocks []ContentBlock) string {
 }
 
 func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
+	// A non-empty per-request override (req.Thinking) wins over Config.ThinkingType.
+	thinkingType := p.cfg.ThinkingType
+	if req.Thinking != "" {
+		thinkingType = req.Thinking
+	}
+	// The request is in thinking mode when either a thinking type is set (a
+	// `thinking` body field goes out) or a reasoning effort is configured — the
+	// same providers that then demand reasoning_content be echoed back.
+	thinking := thinkingType != "" || p.cfg.ReasoningEffort != ""
+
+	msgs := toOpenAIMessages(joinSystem(req.System), req.Messages)
+	msgs = sanitizeOpenAIMessages(msgs, thinking)
+
 	body := oaReq{
 		Model:       p.cfg.Model,
-		Messages:    toOpenAIMessages(joinSystem(req.System), req.Messages),
+		Messages:    msgs,
 		Temperature: req.Temperature,
 		Stop:        req.Stop,
 		Stream:      stream,
@@ -165,11 +250,6 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	// it on a non-streaming request, so send it only when streaming.
 	if stream {
 		body.StreamOptions = &oaStreamOpts{IncludeUsage: true}
-	}
-	// A non-empty per-request override (req.Thinking) wins over Config.ThinkingType.
-	thinkingType := p.cfg.ThinkingType
-	if req.Thinking != "" {
-		thinkingType = req.Thinking
 	}
 	if thinkingType != "" {
 		body.Thinking = &oaThinking{Type: thinkingType}
