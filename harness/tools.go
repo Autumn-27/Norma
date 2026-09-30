@@ -99,6 +99,13 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 	if err != nil {
 		res = tool.Errorf("Error: " + err.Error())
 	}
+	// Global output cap at the single post-tool choke point: EVERY tool —
+	// built-in, MCP, custom, host — is bounded here regardless of whether it
+	// remembered to Capture itself, so no tool can overflow the context window
+	// (the failure mode that motivated this net). CaptureOnce is idempotent:
+	// output a tool already spilled/truncated carries a marker and is left
+	// untouched, so this never double-truncates or double-spills.
+	res = capOutput(tc, res)
 
 	if l.in.Hooks != nil {
 		raw, _ := json.Marshal(res.Flatten())
@@ -110,4 +117,17 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 		content = []llm.ContentBlock{llm.TextBlock("(no output)")}
 	}
 	return llm.ContentBlock{Type: llm.BlockToolResult, ToolUseID: use.ID, Content: content, IsError: res.IsError}, res.Extra
+}
+
+// capOutput runs every text block of a tool result through the idempotent
+// output cap (tool.CaptureOnce). Non-text blocks pass through untouched. It is
+// the one place that guarantees no tool's output — however constructed — can
+// blow past the context budget.
+func capOutput(tc *tool.ToolContext, res tool.Result) tool.Result {
+	for i, b := range res.Content {
+		if b.Type == llm.BlockText {
+			res.Content[i].Text = tool.CaptureOnce(tc, b.Text)
+		}
+	}
+	return res
 }

@@ -50,6 +50,30 @@ func Capture(tc *ToolContext, s string) string {
 	return truncate(s, max)
 }
 
+// alreadyCaptured reports whether s already carries a marker Capture leaves
+// behind — a spill pointer or a head+tail truncation notice. It is how a global
+// post-tool net recognises output a tool already ran through Capture itself.
+//
+// A false negative (legitimate text that happens to contain a marker) only means
+// the guard fails to re-cap already-large output; it never corrupts. The markers
+// are distinctive enough that this is vanishingly rare.
+func alreadyCaptured(s string) bool {
+	return strings.Contains(s, "<persisted-output>") || strings.Contains(s, "characters truncated]")
+}
+
+// CaptureOnce is Capture with an idempotency guard: output a tool already ran
+// through Capture (so it carries a spill pointer or truncation notice) is
+// returned unchanged. This lets a single post-tool net cap every tool's output
+// without re-truncating or re-spilling what built-in / MCP / custom tools
+// already handled themselves. Output within the limit is a no-op either way,
+// since Capture returns it unchanged.
+func CaptureOnce(tc *ToolContext, s string) string {
+	if alreadyCaptured(s) {
+		return s
+	}
+	return Capture(tc, s)
+}
+
 func spillOutput(dir, s string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
