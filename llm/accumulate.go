@@ -54,7 +54,7 @@ func (a *Accumulator) Add(ev StreamEvent) {
 		if ev.StopReason != "" {
 			a.StopReason = ev.StopReason
 		}
-		a.Usage.Add(ev.Usage)
+		a.Usage.MergeEcho(ev.Usage)
 	case SEMessageStop:
 		a.flushText()
 		a.flushThinking()

@@ -289,10 +289,11 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 	case "message_delta":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: f.Delta.StopReason}
 		if f.Usage != nil {
-			// Only output here — the input side (input/cache) was already counted at
-			// message_start; message_delta re-echoes it, so counting it again would
-			// double the input/cache totals.
-			ev.Usage = Usage{OutputTokens: f.Usage.OutputTokens}
+			// Output plus the input side. Real Anthropic re-echoes the input counts
+			// from message_start (the accumulator deduplicates echoed fields with
+			// max, so nothing doubles); Anthropic-compatible emulations that report
+			// zeros in message_start get their real input counts recovered here.
+			ev.Usage = f.Usage.norm()
 		}
 		return ev, true, nil
 	case "message_stop":
