@@ -137,11 +137,63 @@ type SpawnSpec struct {
 // "KEY=VALUE" entries, or nil when extra is empty (child inherits unchanged).
 // os/exec dedups by key — case-insensitive on Windows, keeping the LAST
 // occurrence — so the appended entries override inherited ones on every OS.
+// nonInteractiveEnv are defaults every spawned shell gets: a pager must never
+// block a non-interactive shell waiting for a terminal nobody is watching, and
+// Debian package frontends must never prompt. A host that sets the same key in
+// its own env overrides the default (see withEnv).
+var nonInteractiveEnv = []string{
+	"PAGER=cat",
+	"GIT_PAGER=cat",
+	"SYSTEMD_PAGER=cat",
+	"DEBIAN_FRONTEND=noninteractive",
+}
+
+// withEnv builds the child environment, in precedence order:
+//
+//	process environment  <  nonInteractiveEnv defaults  <  the host's extra vars
+//
+// Overriding needs an explicit drop of the earlier entry: getenv returns the
+// FIRST match, so simply appending a duplicate key does not reliably change the
+// value. The result is never nil — the defaults always apply.
 func withEnv(extra []string) []string {
-	if len(extra) == 0 {
-		return nil
+	extraKeys := make(map[string]bool, len(extra))
+	for _, kv := range extra {
+		if k := envKey(kv); k != "" {
+			extraKeys[k] = true
+		}
 	}
-	return append(os.Environ(), extra...)
+	drop := make(map[string]bool, len(extraKeys)+len(nonInteractiveEnv))
+	for k := range extraKeys {
+		drop[k] = true
+	}
+	for _, kv := range nonInteractiveEnv {
+		if k := envKey(kv); k != "" && !extraKeys[k] {
+			drop[k] = true
+		}
+	}
+	base := os.Environ()
+	out := make([]string, 0, len(base)+len(nonInteractiveEnv)+len(extra))
+	for _, kv := range base {
+		if k := envKey(kv); k != "" && drop[k] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	for _, kv := range nonInteractiveEnv {
+		if k := envKey(kv); k != "" && extraKeys[k] {
+			continue // host override wins
+		}
+		out = append(out, kv)
+	}
+	return append(out, extra...)
+}
+
+// envKey extracts the KEY of a "KEY=value" entry ("" when malformed).
+func envKey(kv string) string {
+	if i := strings.IndexByte(kv, '='); i > 0 {
+		return kv[:i]
+	}
+	return ""
 }
 
 // Manager owns the background tasks of one Session.
@@ -230,9 +282,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	shell, flags := shellCmd()
 	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, spec.Command)...)
 	cmd.Dir = spec.WorkingDir
-	if env := withEnv(spec.Env); env != nil {
-		cmd.Env = env
-	}
+	cmd.Env = withEnv(spec.Env)
 	cmd.Stdout = f
 	cmd.Stderr = f
 	setDetached(cmd)
@@ -510,8 +560,15 @@ func (m *Manager) DrainNotifications() []Notification {
 	return out
 }
 
-// Cleanup kills all tasks, cancels the root context, and removes the session's
-// task directory. Safe to call on a nil Manager.
+// Cleanup kills all tasks, closes PTY sessions and cancels the root context.
+// Safe to call on a nil Manager.
+//
+// The session's task directory is deliberately KEPT: background-task output and
+// the "full output saved to <path>" pointers live there, and those paths are
+// handed to the model (or resumed later) — deleting them on session close turns
+// every such pointer into a dead link. Growth stays bounded by NewManager's
+// stale-session sweep (staleSessionTTL), which removes other sessions' dirs once
+// they are old enough.
 func (m *Manager) Cleanup() {
 	if m == nil {
 		return
@@ -521,7 +578,6 @@ func (m *Manager) Cleanup() {
 	if m.rootCancel != nil {
 		m.rootCancel()
 	}
-	_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>
 }
 
 // tailFile reads the last maxBytes of a file, prefixing a notice when earlier
