@@ -46,6 +46,17 @@ type ContentBlock struct {
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
 
+	// ThoughtSignature is Gemini's opaque per-tool-call token, present on a
+	// tool_use block only when the model was reached through Gemini's
+	// OpenAI-compatible endpoint (generativelanguage.googleapis.com/.../openai).
+	// A Gemini thinking model requires this value to be echoed back verbatim on
+	// the same tool call when the turn is replayed in multi-turn history;
+	// otherwise the API rejects the request with "Function call is missing a
+	// thought_signature in functionCall parts." Every other provider/format
+	// leaves this empty and is unaffected.
+	// See https://ai.google.dev/gemini-api/docs/thinking#signatures.
+	ThoughtSignature string `json:"thought_signature,omitempty"`
+
 	// ToolResult: the outcome of a tool, fed back to the model.
 	ToolUseID string         `json:"tool_use_id,omitempty"`
 	Content   []ContentBlock `json:"content,omitempty"`
