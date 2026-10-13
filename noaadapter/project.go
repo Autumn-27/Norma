@@ -241,6 +241,12 @@ func rebuildBlock(b llm.ContentBlock, c noa.CoreMessage, sc *Sidecar, opts Reass
 		// Writing a malformed payload back would break the call itself.
 		if c.Text != string(b.Input) && json.Valid([]byte(c.Text)) {
 			b.Input = json.RawMessage(c.Text)
+			// Gemini's thought_signature is issued for the functionCall part as
+			// the model emitted it. Replaying it over rewritten arguments is the
+			// same mismatch the BlockThinking case above refuses to create, so
+			// drop it: a missing signature is a loud, documented rejection,
+			// while a stale one claims to authenticate arguments it never saw.
+			b.ThoughtSignature = ""
 		}
 
 	case llm.BlockToolResult:

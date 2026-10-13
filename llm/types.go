@@ -52,9 +52,26 @@ type ContentBlock struct {
 	// A Gemini thinking model requires this value to be echoed back verbatim on
 	// the same tool call when the turn is replayed in multi-turn history;
 	// otherwise the API rejects the request with "Function call is missing a
-	// thought_signature in functionCall parts." Every other provider/format
-	// leaves this empty and is unaffected.
+	// thought_signature in functionCall parts."
 	// See https://ai.google.dev/gemini-api/docs/thinking#signatures.
+	//
+	// It is provider-scoped state that outlives the provider that issued it:
+	// transcripts persist llm.Message verbatim, so a session recorded against
+	// Gemini can be resumed, summarized or sub-agented with a DIFFERENT provider
+	// configured. Two consequences, handled in opposite ways:
+	//
+	//   - Anthropic: ContentBlock is marshaled straight into anthropicReq, so a
+	//     populated field would become an unknown key inside a tool_use block
+	//     and draw "Extra inputs are not permitted". filterThinkingBlocks
+	//     clears it on the way out; this field must never reach that wire.
+	//   - Other OpenAI-compatible gateways: toOpenAIMessages replays it
+	//     unconditionally, because the alternative — sniffing the base URL for
+	//     Google's host — silently drops the signature for anyone reaching
+	//     Gemini through a proxy or Vertex-style path, re-breaking the exact
+	//     rejection this field exists to prevent. Over-sending costs a 400 only
+	//     on a gateway that both forbids unknown fields AND is being fed a
+	//     history recorded elsewhere; that fails loudly and is recoverable,
+	//     whereas a dropped signature fails on every Gemini turn.
 	ThoughtSignature string `json:"thought_signature,omitempty"`
 
 	// ToolResult: the outcome of a tool, fed back to the model.

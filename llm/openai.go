@@ -117,6 +117,9 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 					}
 					// Replay Gemini's thought_signature verbatim, or a thinking
 					// model 400s on this tool call when the turn is replayed.
+					// Unconditional on purpose, including against non-Google
+					// gateways — see ContentBlock.ThoughtSignature for why
+					// sniffing the base URL would be the worse failure.
 					if b.ThoughtSignature != "" {
 						tc.ExtraContent = &oaExtraContent{Google: &oaGoogleExtra{ThoughtSignature: b.ThoughtSignature}}
 					}
@@ -593,16 +596,20 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 	for _, tc := range ch.Delta.ToolCalls {
 		if !started[tc.Index] && (tc.ID != "" || tc.Function.Name != "") {
 			started[tc.Index] = true
-			evs = append(evs, StreamEvent{Type: SEToolUseStart, ToolID: tc.ID, ToolName: tc.Function.Name})
+			evs = append(evs, StreamEvent{Type: SEToolUseStart, ToolID: tc.ID, ToolName: tc.Function.Name, ToolIndex: tc.Index})
 		}
 		if tc.Function.Arguments != "" {
 			evs = append(evs, StreamEvent{Type: SEToolInputJSON, Text: tc.Function.Arguments})
 		}
 		// Gemini attaches thought_signature to the delta that completes this
 		// tool call, after its arguments — mirrors how SEThinkingSignature
-		// trails a thinking block's deltas.
+		// trails a thinking block's deltas. Carry tc.Index: with parallel calls
+		// a frame for index 0 can arrive after call 1 has started, and routing
+		// the signature to "whichever started last" would put it on the wrong
+		// call — producing exactly the missing-thought_signature rejection this
+		// plumbing exists to prevent.
 		if sig := thoughtSignature(tc); sig != "" {
-			evs = append(evs, StreamEvent{Type: SEToolUseSignature, Text: sig})
+			evs = append(evs, StreamEvent{Type: SEToolUseSignature, Text: sig, ToolIndex: tc.Index})
 		}
 	}
 	if ch.FinishReason != "" {

@@ -338,6 +338,15 @@ func (u anthropicUsage) norm() Usage {
 // recorded with no text or tool_use. (A thinking-only turn WITH thinking
 // enabled keeps its thinking block — that is valid content and must be
 // replayed.)
+//
+// It also clears ContentBlock.ThoughtSignature, which belongs to Gemini's
+// OpenAI-compatible endpoint. anthropicReq.Messages is []Message, so
+// ContentBlock is marshaled straight onto the Anthropic wire and any populated
+// field becomes a key inside a tool_use block — Anthropic answers an unknown key
+// with "Extra inputs are not permitted". That history is reachable: transcripts
+// persist llm.Message verbatim, so a session recorded against Gemini and then
+// resumed (or summarized, or handed to a subagent) with an Anthropic provider
+// would fail on every turn.
 func filterThinkingBlocks(msgs []Message, thinkingEnabled bool) []Message {
 	out := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
@@ -354,13 +363,43 @@ func filterThinkingBlocks(msgs []Message, thinkingEnabled bool) []Message {
 		if len(content) == 0 {
 			continue // empty content array is rejected by Anthropic — drop it
 		}
-		if len(content) == len(m.Content) {
+		content = stripThoughtSignatures(content)
+		if len(content) == len(m.Content) && sameBacking(content, m.Content) {
 			out = append(out, m)
 		} else {
 			out = append(out, Message{Role: m.Role, Content: content})
 		}
 	}
 	return out
+}
+
+// stripThoughtSignatures clears ThoughtSignature on every block, copying only
+// when at least one is set so untouched history keeps sharing its backing array.
+// Callers own the returned slice; the input is never mutated — it belongs to the
+// caller's conversation state and must survive the request unchanged.
+func stripThoughtSignatures(content []ContentBlock) []ContentBlock {
+	idx := -1
+	for i, b := range content {
+		if b.ThoughtSignature != "" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return content
+	}
+	out := make([]ContentBlock, len(content))
+	copy(out, content)
+	for i := idx; i < len(out); i++ {
+		out[i].ThoughtSignature = ""
+	}
+	return out
+}
+
+// sameBacking reports whether two slices share their first element's address,
+// i.e. whether a normalization step above returned the input untouched.
+func sameBacking(a, b []ContentBlock) bool {
+	return len(a) == 0 || len(b) == 0 || &a[0] == &b[0]
 }
 
 // mergeAdjacentSameRole coalesces consecutive same-role messages into one by
