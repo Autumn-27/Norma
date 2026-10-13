@@ -239,7 +239,17 @@ func NewManager(sessionID string) (*Manager, error) {
 	}, nil
 }
 
-// cleanStaleSessions removes sibling session directories older than the TTL.
+// cleanStaleSessions removes sibling session directories older than the TTL —
+// those belong to sessions that died without running Cleanup (crash, SIGKILL).
+//
+// Staleness is judged by the NEWEST mtime in the directory, not the session
+// dir's own. MkdirAll stamps <base>/<sessionID> once and all writes land in
+// <sessionID>/tasks, so the session dir's mtime is frozen at creation and never
+// refreshed by activity: judging by it alone deletes a session that is alive and
+// busy but simply older than the TTL, out from under itself — Manager.Output
+// then fails with ENOENT and watchSize silently stops enforcing the output cap.
+// Output files are appended to as a task runs, so their mtimes are the signal
+// that something is still using this directory.
 func cleanStaleSessions(base, current string) {
 	entries, err := os.ReadDir(base)
 	if err != nil {
@@ -250,14 +260,48 @@ func cleanStaleSessions(base, current string) {
 		if !e.IsDir() || e.Name() == current {
 			continue
 		}
-		info, err := e.Info()
+		dir := filepath.Join(base, e.Name())
+		if newestMTime(dir).Before(cutoff) {
+			_ = os.RemoveAll(dir)
+		}
+	}
+}
+
+// newestMTime returns the most recent mtime of dir or anything one level below
+// it (<sessionID>/tasks and the output files inside). One level is enough: the
+// layout is fixed at <base>/<sessionID>/tasks/<file>.
+func newestMTime(dir string) time.Time {
+	var newest time.Time
+	bump := func(t time.Time) {
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	if fi, err := os.Stat(dir); err == nil {
+		bump(fi.ModTime())
+	}
+	subs, err := os.ReadDir(dir)
+	if err != nil {
+		return newest
+	}
+	for _, s := range subs {
+		if info, err := s.Info(); err == nil {
+			bump(info.ModTime())
+		}
+		if !s.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(dir, s.Name()))
 		if err != nil {
 			continue
 		}
-		if info.ModTime().Before(cutoff) {
-			_ = os.RemoveAll(filepath.Join(base, e.Name()))
+		for _, f := range files {
+			if info, err := f.Info(); err == nil {
+				bump(info.ModTime())
+			}
 		}
 	}
+	return newest
 }
 
 // Spawn launches a process detached from the per-turn context. Its output streams
@@ -560,21 +604,31 @@ func (m *Manager) DrainNotifications() []Notification {
 	return out
 }
 
-// Cleanup kills all tasks, closes PTY sessions and cancels the root context.
-// Safe to call on a nil Manager.
+// Cleanup kills all tasks, closes PTY sessions, removes the session's task
+// directory and cancels the root context. Safe to call on a nil Manager.
 //
-// The session's task directory is deliberately KEPT: background-task output and
-// the "full output saved to <path>" pointers live there, and those paths are
-// handed to the model (or resumed later) — deleting them on session close turns
-// every such pointer into a dead link. Growth stays bounded by NewManager's
-// stale-session sweep (staleSessionTTL), which removes other sessions' dirs once
-// they are old enough.
+// Removing the directory does strand the "full output saved to <path>" pointers
+// that were handed to the model, which is a real cost. It is still the right
+// trade: agentcore mints a fresh random sessionID per Session, so keeping the
+// directory means every run of the host leaves one behind, each task file capped
+// only at maxTaskOutputBytes (50 MiB), with the stale sweep below as the sole
+// reclaimer — and that sweep runs only inside NewManager, so a host that stops
+// opening sessions never reclaims at all. Deterministic cleanup at a known cost
+// beats unbounded growth in the host's temp dir.
+//
+// Those pointers are consumed inside the session that produced them. Making
+// them genuinely durable needs spill output to live in a host-chosen directory
+// with its own retention policy, not in os.TempDir() keyed by a per-session
+// UUID; that is a design change, not a change to this function.
 func (m *Manager) Cleanup() {
 	if m == nil {
 		return
 	}
 	m.KillAll()
 	m.closeAllSessions()
+	if m.dir != "" {
+		_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>, not just its tasks/
+	}
 	if m.rootCancel != nil {
 		m.rootCancel()
 	}

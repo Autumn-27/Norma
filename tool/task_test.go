@@ -239,32 +239,71 @@ func TestTailFileOmitsEarlier(t *testing.T) {
 	}
 }
 
-// Cleanup ends the session's processes but KEEPS its task directory: background
-// output and "full output saved to <path>" pointers outlive the session (a later
-// command, or a resumed session, still reads them). Growth is bounded by the
-// stale-session sweep in NewManager, not by deleting live pointers.
-func TestCleanupKeepsTaskDir(t *testing.T) {
+// Cleanup ends the session's processes AND removes its task directory. Every
+// Session gets a fresh random sessionID, so leaving the directory behind would
+// grow the host's temp dir without a bound that anything reliably enforces.
+func TestCleanupRemovesDir(t *testing.T) {
 	m, err := NewManager("cleanup-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	task, _ := m.Spawn(SpawnSpec{Command: "sleep 5"})
 	dir := filepath.Dir(m.dir)
-	kept := filepath.Join(m.dir, "kept.txt")
-	if err := os.WriteFile(kept, []byte("background output"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(m.dir, "spilled.txt"), []byte("output"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m.Cleanup()
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("session dir must survive Cleanup: %v", err)
-	}
-	if b, err := os.ReadFile(kept); err != nil || string(b) != "background output" {
-		t.Fatalf("task output must survive Cleanup: %q err=%v", b, err)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("session dir must not survive Cleanup: err=%v", err)
 	}
 	// The spawned process is killed by Cleanup.
 	info, _ := m.Get(task.ID)
 	if info.Status == TaskRunning {
 		t.Fatalf("task still running after cleanup")
+	}
+}
+
+// The stale sweep must not delete a session that is alive and busy but older
+// than the TTL. The session dir's own mtime is stamped once by MkdirAll and
+// never refreshed, so judging by it alone would remove a long-running session's
+// directory out from under it — the dead-pointer failure the sweep is meant to
+// avoid causing.
+func TestCleanStaleSessionsKeepsActiveSessions(t *testing.T) {
+	base := t.TempDir()
+	old := time.Now().Add(-2 * staleSessionTTL)
+
+	// A session that crashed long ago: nothing inside is recent.
+	dead := filepath.Join(base, "dead", "tasks")
+	if err := os.MkdirAll(dead, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deadFile := filepath.Join(dead, "out.log")
+	if err := os.WriteFile(deadFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A session whose dir is equally old but whose task output is still being
+	// appended to right now.
+	busy := filepath.Join(base, "busy", "tasks")
+	if err := os.MkdirAll(busy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	busyFile := filepath.Join(busy, "out.log")
+	if err := os.WriteFile(busyFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{deadFile, dead, filepath.Dir(dead), busy, filepath.Dir(busy)} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cleanStaleSessions(base, "current")
+
+	if _, err := os.Stat(filepath.Dir(dead)); !os.IsNotExist(err) {
+		t.Errorf("stale session dir survived the sweep: err=%v", err)
+	}
+	if _, err := os.Stat(busyFile); err != nil {
+		t.Errorf("active session was swept away despite recent task output: %v", err)
 	}
 }
 
