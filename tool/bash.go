@@ -35,7 +35,8 @@ func NewBash() CoreTool {
 		"command":    map[string]any{"type": "string", "description": "The shell command to execute."},
 		"timeout_ms": map[string]any{"type": "integer", "description": "Timeout in ms (default 120000, max 600000)."},
 	}
-	desc := "Executes a shell command in the working directory and returns combined stdout and stderr. Use for running tests, builds, package managers, and git. Prefer the dedicated file tools for file work."
+	desc := "Executes a shell command in the working directory and returns combined stdout and stderr. Use for running tests, builds, package managers, and git. Prefer the dedicated file tools for file work. " +
+		fmt.Sprintf("A per-command memory cap (%s) kills a command whose process tree leaks memory; the error names the cap.", humanBytes(memCapBytes()))
 	prompt := "The command runs through the shell, so you are not limited to one command: chain steps with && or ;, use pipes, and pass multi-line scripts or heredocs. For anything beyond a simple one-liner — loops, parsing, string/JSON handling, HTTP logic, computation — prefer writing a short script (Python, Node, shell, etc.) and executing it (e.g. via a heredoc or by writing a file then running it) rather than forcing everything into a single command. A timeout (default 120s, max 600s) applies. Avoid commands needing interactive input."
 	if !BackgroundTasksDisabled() {
 		props["run_in_background"] = map[string]any{
@@ -128,6 +129,19 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 		if info.Status == TaskFailed {
 			if strings.TrimSpace(output) == "" {
 				output = "(no output)"
+			}
+			// A watchdog kill exits as -1 with no output of its own; the exit
+			// code alone would read as a cryptic failure, so name the cap that
+			// fired and what to change about the command.
+			switch info.Reason {
+			case terminateMemory:
+				return Errorf(Capture(tc, output) + fmt.Sprintf(
+					"\n\n[terminated: the command's process tree exceeded the %s per-command memory cap and was killed — stream or page the data instead of accumulating it in memory]",
+					humanBytes(memCapBytes()))), nil
+			case terminateOversize:
+				return Errorf(Capture(tc, output) + fmt.Sprintf(
+					"\n\n[terminated: output exceeded the %d MiB per-task output cap]",
+					maxTaskOutputBytes>>20)), nil
 			}
 			return Errorf(fmt.Sprintf("%s\n\n[exit code %d]", Capture(tc, output), info.ExitCode)), nil
 		}

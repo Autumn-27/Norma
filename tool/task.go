@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,16 @@ const (
 	// staleSessionTTL bounds how long another session's task directory survives
 	// before it is garbage-collected on the next Manager creation.
 	staleSessionTTL = 24 * time.Hour
+	// defaultMemCap bounds one task's process-tree RSS (bytes); the memory
+	// watchdog kills the process group past it (see watchMemory).
+	defaultMemCap = 2 << 30 // 2 GiB
+)
+
+// Termination reasons recorded by the watchdogs. An empty reason means a natural
+// exit or a manual Kill — both of which already speak for themselves.
+const (
+	terminateOversize = "oversize" // output file grew past maxTaskOutputBytes
+	terminateMemory   = "memory"   // process-tree RSS grew past the memory cap
 )
 
 // Task is a single background process tracked by a Manager. Its mutable fields
@@ -70,9 +81,9 @@ type Task struct {
 	OutputPath  string
 
 	// internal, guarded by Manager.mu
-	backgrounded bool          // surfaced as a background task: notify on exit
-	notified     bool          // completion already enqueued into pending
-	oversize     bool          // terminated by the size watchdog
+	backgrounded bool // surfaced as a background task: notify on exit
+	notified     bool // completion already enqueued into pending
+	reason       string
 	cmd          *exec.Cmd
 	done         chan struct{} // closed by watch when the process exits
 }
@@ -80,7 +91,7 @@ type Task struct {
 func (t *Task) info() TaskInfo {
 	return TaskInfo{
 		ID: t.ID, Kind: t.Kind, Command: t.Command, Description: t.Description,
-		Status: t.Status, ExitCode: t.ExitCode,
+		Status: t.Status, ExitCode: t.ExitCode, Reason: t.reason,
 		StartTime: t.StartTime, EndTime: t.EndTime,
 		OutputPath: t.OutputPath, Backgrounded: t.backgrounded,
 	}
@@ -94,9 +105,12 @@ type TaskInfo struct {
 	Description string
 	Status      TaskStatus
 	ExitCode    int
-	StartTime   time.Time
-	EndTime     time.Time
-	OutputPath  string
+	// Reason is the watchdog that terminated the task: terminateOversize or
+	// terminateMemory. Empty for a natural exit and for a manual Kill.
+	Reason       string
+	StartTime    time.Time
+	EndTime      time.Time
+	OutputPath   string
 	Backgrounded bool
 }
 
@@ -364,6 +378,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 func (m *Manager) watch(t *Task, f *os.File) {
 	stop := make(chan struct{})
 	go m.watchSize(t, stop)
+	go m.watchMemory(t, stop)
 
 	err := t.cmd.Wait()
 	close(stop)
@@ -401,23 +416,34 @@ func (m *Manager) watchSize(t *Task, stop chan struct{}) {
 			return
 		case <-ticker.C:
 			if fi, err := os.Stat(t.OutputPath); err == nil && fi.Size() > maxTaskOutputBytes {
-				m.terminate(t, TaskFailed, true)
+				m.terminate(t, TaskFailed, terminateOversize)
 				return
 			}
 		}
 	}
 }
 
-// terminate kills a still-running task, recording the given terminal status. The
-// watch goroutine observes the exit and finalizes EndTime / notifications.
-func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
+// terminate kills a still-running task, recording the given terminal status and
+// watchdog reason. The watch goroutine observes the exit and finalizes EndTime.
+//
+// A watchdog kill enqueues its notification HERE, atomically with the status
+// flip: the status becomes readable before the process actually dies (watch only
+// runs its notification path after Wait returns), and a backgrounded task must
+// never be observed terminal-without-notification. A manual kill stays silent —
+// its own tool result already confirms it — and a natural exit is still
+// notified from watch, where the exit code is known.
+func (m *Manager) terminate(t *Task, status TaskStatus, reason string) {
 	m.mu.Lock()
 	if t.Status != TaskRunning {
 		m.mu.Unlock()
 		return
 	}
 	t.Status = status
-	t.oversize = oversize
+	t.reason = reason
+	if reason != "" && t.backgrounded && !t.notified {
+		t.notified = true
+		m.pending = append(m.pending, m.notifFor(t))
+	}
 	proc := t.cmd.Process
 	m.mu.Unlock()
 	if proc != nil {
@@ -425,11 +451,124 @@ func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
 	}
 }
 
+// watchMemory terminates a task whose process tree grows past the memory cap —
+// the twin of watchSize: a task that leaks memory in a loop (an accumulator that
+// never terminates, a scanner that re-reads its own output) must die at a bound
+// instead of dragging the whole host process with it. Sampling is /proc-based
+// and linux-only; elsewhere procTreeRSS reports unavailable and the watchdog
+// stands down.
+//
+// The sample is the tree's TOTAL RSS, read every two seconds (the same cadence
+// as watchSize). Between ticks a process may still overshoot the cap by the
+// amount it grows in that window; the bound is a guard, not a wall. A single
+// sample over the cap kills — a runaway stays over on every later sample too,
+// and a command that briefly peaks then frees is one the host should have
+// written differently, not one the guard should learn to excuse.
+//
+// The legacy sync path (runBashSync, no Manager) has no watchdog; hosts that
+// care about the cap route their Bash through the task manager.
+func (m *Manager) watchMemory(t *Task, stop chan struct{}) {
+	cap := memCapBytes()
+	if cap <= 0 || t.cmd.Process == nil {
+		return
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			total, ok := procTreeRSS(t.cmd.Process)
+			if !ok { // root already gone — the exit path wins the race
+				continue
+			}
+			if total > cap {
+				m.terminate(t, TaskFailed, terminateMemory)
+				return
+			}
+		}
+	}
+}
+
+// memCapBytes returns the per-task memory cap in bytes (defaultMemCap when
+// unset). AGENT_CORE_TASK_MEM_CAP overrides it ("512m", "2g", plain bytes);
+// "0" or "off" disables the guard. An unparseable value falls back to the
+// default rather than to disabled — a typo must not open the floodgate.
+func memCapBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv("AGENT_CORE_TASK_MEM_CAP"))
+	if raw == "" {
+		return defaultMemCap
+	}
+	v, ok := parseMemCap(raw)
+	if !ok {
+		return defaultMemCap
+	}
+	return v
+}
+
+// memUnits orders every accepted suffix longest-first so the match is
+// deterministic ("512mb" must read as 512 MiB, not "512m" + leftover "b").
+var memUnits = []struct {
+	suffix string
+	mult   int64
+}{
+	{"kib", 1 << 10}, {"mib", 1 << 20}, {"gib", 1 << 30}, {"tib", 1 << 40},
+	{"kb", 1 << 10}, {"mb", 1 << 20}, {"gb", 1 << 30}, {"tb", 1 << 40},
+	{"b", 1}, {"k", 1 << 10}, {"m", 1 << 20}, {"g", 1 << 30}, {"t", 1 << 40},
+}
+
+// parseMemCap parses a memory quantity: a non-negative integer plus an optional
+// b/k/m/g/t unit (byte, binary and SI spellings, case-insensitive). "0" and
+// "off" disable the cap.
+func parseMemCap(s string) (int64, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "0" || s == "off" {
+		return 0, true
+	}
+	mult := int64(1)
+	for _, u := range memUnits {
+		if strings.HasSuffix(s, u.suffix) {
+			s = strings.TrimSuffix(s, u.suffix)
+			mult = u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n * mult, true
+}
+
+// humanBytes renders a byte count in the first binary unit that fits — whole
+// when it divides, one decimal otherwise — the form caps appear in the
+// user-visible error and notification texts.
+func humanBytes(n int64) string {
+	for _, u := range []struct {
+		name string
+		size int64
+	}{
+		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10},
+	} {
+		if n < u.size {
+			continue
+		}
+		if n%u.size == 0 {
+			return fmt.Sprintf("%d%s", n/u.size, u.name)
+		}
+		return fmt.Sprintf("%.1f%s", float64(n)/float64(u.size), u.name)
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
 func (m *Manager) notifFor(t *Task) Notification {
 	var sum string
 	switch {
-	case t.oversize:
+	case t.reason == terminateOversize:
 		sum = fmt.Sprintf("Task %q 输出超过上限已被终止 (%s)。", short(t.Command), t.Kind)
+	case t.reason == terminateMemory:
+		sum = fmt.Sprintf("Task %q 内存占用超过单条命令上限 %s，进程树已被终止。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), humanBytes(memCapBytes()))
 	case t.Status == TaskCompleted:
 		sum = fmt.Sprintf("Task %q 已完成 (exit %d)。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), t.ExitCode)
 	case t.Status == TaskFailed:
@@ -512,7 +651,7 @@ func (m *Manager) Kill(id string) bool {
 	if !ok {
 		return false
 	}
-	m.terminate(t, TaskKilled, false)
+	m.terminate(t, TaskKilled, "")
 	return true
 }
 
@@ -530,7 +669,7 @@ func (m *Manager) KillAll() int {
 		running := t.Status == TaskRunning
 		m.mu.Unlock()
 		if running {
-			m.terminate(t, TaskKilled, false)
+			m.terminate(t, TaskKilled, "")
 			n++
 		}
 	}
