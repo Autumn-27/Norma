@@ -239,20 +239,81 @@ func TestTailFileOmitsEarlier(t *testing.T) {
 	}
 }
 
-func TestCleanupRemovesDir(t *testing.T) {
+// Cleanup ends the session's processes but KEEPS its task directory: background
+// output and "full output saved to <path>" pointers outlive the session (a later
+// command, or a resumed session, still reads them). Growth is bounded by the
+// stale-session sweep in NewManager, not by deleting live pointers.
+func TestCleanupKeepsTaskDir(t *testing.T) {
 	m, err := NewManager("cleanup-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	task, _ := m.Spawn(SpawnSpec{Command: "sleep 5"})
 	dir := filepath.Dir(m.dir)
+	kept := filepath.Join(m.dir, "kept.txt")
+	if err := os.WriteFile(kept, []byte("background output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	m.Cleanup()
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("session dir not removed: %v", err)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("session dir must survive Cleanup: %v", err)
+	}
+	if b, err := os.ReadFile(kept); err != nil || string(b) != "background output" {
+		t.Fatalf("task output must survive Cleanup: %q err=%v", b, err)
 	}
 	// The spawned process is killed by Cleanup.
 	info, _ := m.Get(task.ID)
 	if info.Status == TaskRunning {
 		t.Fatalf("task still running after cleanup")
 	}
+}
+
+// withEnv puts the non-interactive defaults in front of nothing and behind the
+// host: a spawned shell never blocks on a pager, and a host that names a value
+// explicitly still wins — without duplicate keys, since getenv returns the first
+// match and an appended duplicate would silently lose.
+func TestWithEnvNonInteractiveDefaults(t *testing.T) {
+	env := withEnv(nil)
+	want := map[string]string{
+		"PAGER": "cat", "GIT_PAGER": "cat", "SYSTEMD_PAGER": "cat",
+		"DEBIAN_FRONTEND": "noninteractive",
+	}
+	for k, v := range want {
+		if got := envValue(env, k); got != v {
+			t.Fatalf("%s=%q, want %q", k, got, v)
+		}
+	}
+	host := withEnv([]string{"PAGER=less", "ARTEX_MARK=1"})
+	if got := envValue(host, "PAGER"); got != "less" {
+		t.Fatalf("host override lost: PAGER=%q", got)
+	}
+	if got := envValue(host, "ARTEX_MARK"); got != "1" {
+		t.Fatalf("host var lost: ARTEX_MARK=%q", got)
+	}
+	if got := envValue(host, "GIT_PAGER"); got != "cat" {
+		t.Fatalf("default must still apply when the host is silent: GIT_PAGER=%q", got)
+	}
+	if n := countKey(host, "PAGER"); n != 1 {
+		t.Fatalf("duplicate PAGER entries: %d (first match wins, so a duplicate is a silent bug)", n)
+	}
+}
+
+// envValue reads a key the way a child process would: the FIRST matching entry.
+func envValue(env []string, key string) string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			return strings.TrimPrefix(kv, key+"=")
+		}
+	}
+	return ""
+}
+
+func countKey(env []string, key string) int {
+	n := 0
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			n++
+		}
+	}
+	return n
 }
