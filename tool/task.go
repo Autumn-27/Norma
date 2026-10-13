@@ -129,18 +129,17 @@ type SpawnSpec struct {
 	Kind        TaskKind
 	WorkingDir  string
 	// Env holds extra "KEY=VALUE" entries layered onto the process environment for
-	// this command (see ToolContext.Env). Empty = inherit unchanged.
+	// this command (see ToolContext.Env). Empty still applies nonInteractiveEnv.
 	Env []string
 }
 
-// withEnv returns the current process environment extended with extra
-// "KEY=VALUE" entries, or nil when extra is empty (child inherits unchanged).
-// os/exec dedups by key — case-insensitive on Windows, keeping the LAST
-// occurrence — so the appended entries override inherited ones on every OS.
-// nonInteractiveEnv are defaults every spawned shell gets: a pager must never
-// block a non-interactive shell waiting for a terminal nobody is watching, and
-// Debian package frontends must never prompt. A host that sets the same key in
-// its own env overrides the default (see withEnv).
+// nonInteractiveEnv are defaults every spawned shell gets, whether or not the
+// host passes any env of its own: a pager must never block a non-interactive
+// shell waiting for a terminal nobody is watching, and Debian package frontends
+// must never prompt. These deliberately override values inherited from the
+// agent's own process — an operator who exports PAGER=less for their shell would
+// otherwise hand every child a pager that hangs. A host that names the same key
+// explicitly still wins (see withEnv).
 var nonInteractiveEnv = []string{
 	"PAGER=cat",
 	"GIT_PAGER=cat",
@@ -152,9 +151,14 @@ var nonInteractiveEnv = []string{
 //
 //	process environment  <  nonInteractiveEnv defaults  <  the host's extra vars
 //
-// Overriding needs an explicit drop of the earlier entry: getenv returns the
-// FIRST match, so simply appending a duplicate key does not reliably change the
-// value. The result is never nil — the defaults always apply.
+// Each layer is applied by DROPPING the earlier entry for that key rather than
+// appending a duplicate. os/exec's own dedup would resolve duplicates in favour
+// of the last occurrence, so appending alone would work for a child it spawns;
+// dropping makes the slice correct on its own terms, so it also reads correctly
+// anywhere it is inspected, logged, or handed to something that does not dedup.
+// (mcp/stdio.go relies on exec's last-wins dedup and is fine as it is.)
+//
+// The result is never nil — the defaults always apply.
 func withEnv(extra []string) []string {
 	extraKeys := make(map[string]bool, len(extra))
 	for _, kv := range extra {

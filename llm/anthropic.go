@@ -263,10 +263,16 @@ func parseAnthropicFrame(data string) (StreamEvent, bool, error) {
 	case "message_start":
 		if f.Message.Usage != nil {
 			// Anthropic reports the full input side (input + cache read/creation) in
-			// BOTH message_start and message_delta. To avoid double-counting when the
-			// accumulator folds both events, message_start carries ONLY the input side
-			// and message_delta carries ONLY output. The initial output_tokens here is
-			// a placeholder (≈1), so drop it — the real output comes from message_delta.
+			// BOTH message_start and message_delta — the two ECHO it rather than
+			// partition it. Both events therefore carry the input side, and
+			// Usage.MergeEcho (not Add) is what keeps it from doubling: it takes the
+			// max per echoed field and accumulates only output. Do NOT "fix" this by
+			// making message_delta output-only again — Anthropic-compatible
+			// emulations report zeros here and the real input counts only in
+			// message_delta, and dropping the delta's input side meters them at 0.
+			//
+			// The initial output_tokens here is a placeholder (≈1), so drop it: it is
+			// not an echo of anything and MergeEcho would add it to the real count.
 			u := f.Message.Usage.norm()
 			u.OutputTokens = 0
 			return StreamEvent{Type: SEMessageStart, Usage: u}, true, nil

@@ -67,7 +67,9 @@ type QueryInput struct {
 	TodoReminderTurnsBetweenReminder int
 
 	// BashEnv holds extra "KEY=VALUE" entries injected into Bash subprocess
-	// environments (foreground + background). Empty = inherit unchanged.
+	// environments (foreground + background). Empty still applies the
+	// non-interactive defaults (PAGER/GIT_PAGER/SYSTEMD_PAGER/DEBIAN_FRONTEND);
+	// see tool.ToolContext.Env.
 	BashEnv []string
 
 	// Permission policy.

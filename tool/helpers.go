@@ -79,9 +79,16 @@ func CaptureOnce(tc *ToolContext, s string) string {
 func spillOutput(dir, s string) (string, error) {
 	// Resolve the directory first: the returned pointer is what the model will
 	// read, so it must not depend on anyone's current working directory.
+	//
+	// A failure here is reported rather than papered over with the relative
+	// path. filepath.Abs only fails when dir is relative and os.Getwd fails —
+	// i.e. the process's cwd has been deleted, which is precisely when a
+	// relative pointer is most useless. Capture's caller falls back to
+	// truncate(), which hands the model bounded output instead of a path it
+	// cannot resolve.
 	abs, err := filepath.Abs(dir)
 	if err != nil {
-		abs = dir
+		return "", err
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return "", err

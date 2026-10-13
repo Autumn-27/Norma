@@ -165,8 +165,13 @@ type Options struct {
 
 	// BashEnv holds extra "KEY=VALUE" entries injected into the environment of
 	// Bash subprocesses (foreground + background), overriding inherited values.
-	// The agent's own process env is untouched. Empty = inherit unchanged. Used
-	// e.g. to route child-command HTTP through a proxy and trust its CA.
+	// The agent's own process env is untouched. Used e.g. to route child-command
+	// HTTP through a proxy and trust its CA.
+	//
+	// Empty does NOT mean "inherit unchanged": children always get the
+	// non-interactive defaults for PAGER, GIT_PAGER, SYSTEMD_PAGER and
+	// DEBIAN_FRONTEND, which override whatever the agent process inherited for
+	// those keys. Name one here to take it back.
 	BashEnv []string
 
 	// Transcript, when non-nil, persists the conversation to an append-only

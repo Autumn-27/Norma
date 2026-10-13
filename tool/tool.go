@@ -38,9 +38,14 @@ type ToolContext struct {
 	Tasks *Manager
 	// Env holds extra "KEY=VALUE" entries injected into the environment of Bash
 	// subprocesses (both foreground and background). Applied on top of the parent
-	// process environment, so these override inherited values. Empty = inherit
-	// unchanged. Used e.g. to route child-command HTTP through a proxy + trust a
-	// CA, without affecting the agent's own process.
+	// process environment, so these override inherited values. Used e.g. to route
+	// child-command HTTP through a proxy + trust a CA, without affecting the
+	// agent's own process.
+	//
+	// Empty does NOT mean "inherit unchanged": children always get the
+	// non-interactive defaults (PAGER, GIT_PAGER, SYSTEMD_PAGER,
+	// DEBIAN_FRONTEND — see tool.nonInteractiveEnv), which override any value
+	// inherited for those four keys. Naming one here is how a host takes it back.
 	Env []string
 }
 
