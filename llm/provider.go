@@ -22,8 +22,13 @@ const (
 	SEThinkingSignature StreamEventType = "thinking_signature"
 	SEToolUseStart      StreamEventType = "tool_use_start"
 	SEToolInputJSON     StreamEventType = "tool_input_delta"
-	SEMessageDelta      StreamEventType = "message_delta" // carries stop_reason / usage
-	SEMessageStop       StreamEventType = "message_stop"
+	// SEToolUseSignature carries Gemini's thought_signature for the current
+	// tool_use block (see ContentBlock.ThoughtSignature). Mirrors
+	// SEThinkingSignature's role for thinking blocks; emitted only by the
+	// OpenAI adapter against Gemini's compatibility endpoint.
+	SEToolUseSignature StreamEventType = "tool_use_signature"
+	SEMessageDelta     StreamEventType = "message_delta" // carries stop_reason / usage
+	SEMessageStop      StreamEventType = "message_stop"
 )
 
 // StreamEvent is one normalized model-level streaming event (FR-03.5).

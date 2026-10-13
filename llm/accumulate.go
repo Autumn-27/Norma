@@ -12,6 +12,7 @@ import (
 type Accumulator struct {
 	blocks     []ContentBlock
 	toolInputs []*strings.Builder
+	toolSigs   []string // ThoughtSignature for the tool_use block at the same index as toolInputs
 	textBuf    *strings.Builder
 	thinkBuf   *strings.Builder
 	thinkSig   string // signature for the current thinking block
@@ -46,9 +47,14 @@ func (a *Accumulator) Add(ev StreamEvent) {
 		a.flushThinking()
 		a.blocks = append(a.blocks, ContentBlock{Type: BlockToolUse, ID: ev.ToolID, Name: ev.ToolName})
 		a.toolInputs = append(a.toolInputs, &strings.Builder{})
+		a.toolSigs = append(a.toolSigs, "")
 	case SEToolInputJSON:
 		if n := len(a.toolInputs); n > 0 {
 			a.toolInputs[n-1].WriteString(ev.Text)
+		}
+	case SEToolUseSignature:
+		if n := len(a.toolSigs); n > 0 {
+			a.toolSigs[n-1] = ev.Text
 		}
 	case SEMessageDelta:
 		if ev.StopReason != "" {
@@ -94,11 +100,12 @@ func (a *Accumulator) Message() Message {
 	for i, b := range a.blocks {
 		if b.Type == BlockToolUse {
 			raw := strings.TrimSpace(a.toolInputs[ti].String())
-			ti++
 			if raw == "" || !json.Valid([]byte(raw)) {
 				raw = "{}"
 			}
 			b.Input = json.RawMessage(raw)
+			b.ThoughtSignature = a.toolSigs[ti]
+			ti++
 		}
 		out[i] = b
 	}
