@@ -114,6 +114,25 @@ func (u *Usage) Add(o Usage) {
 	u.CacheWriteTokens += o.CacheWriteTokens
 }
 
+// MergeEcho folds a usage report that may re-echo fields already counted by an
+// earlier event (Anthropic repeats the input side in message_start and
+// message_delta): echoed input/cache fields take the max instead of summing,
+// while output keeps accumulating. Emulations that report zeros in
+// message_start and real counts only in message_delta are thereby recovered
+// instead of lost.
+func (u *Usage) MergeEcho(o Usage) {
+	u.OutputTokens += o.OutputTokens
+	if o.InputTokens > u.InputTokens {
+		u.InputTokens = o.InputTokens
+	}
+	if o.CacheReadTokens > u.CacheReadTokens {
+		u.CacheReadTokens = o.CacheReadTokens
+	}
+	if o.CacheWriteTokens > u.CacheWriteTokens {
+		u.CacheWriteTokens = o.CacheWriteTokens
+	}
+}
+
 // ToolSchema is a tool definition exposed to the model.
 type ToolSchema struct {
 	Name        string         `json:"name"`
