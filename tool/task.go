@@ -665,7 +665,12 @@ func tailFile(path string, maxBytes int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + string(b), nil
+	// Seeking to a byte offset lands mid-rune for any multi-byte output, and
+	// this tail goes straight to the model via Manager.Output/TaskOutput — the
+	// harness-level capture net leaves it alone because it is already under the
+	// limit. cutTail drops the partial leading rune.
+	tail := string(b)[runeSafeStart(b):]
+	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + tail, nil
 }
 
 // shellCmd returns the platform shell and the argument flags that precede the
@@ -685,7 +690,9 @@ func short(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) > 60 {
-		return s[:57] + "..."
+		// This lands in notification summaries, so a CJK/emoji command must not
+		// be cut mid-rune into a replacement character.
+		return cutHead(s, 57) + "..."
 	}
 	return s
 }

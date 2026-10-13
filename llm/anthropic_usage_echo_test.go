@@ -65,3 +65,34 @@ func TestAccumulatorRealAnthropicStreamNoDoubleCount(t *testing.T) {
 		t.Fatalf("real-Anthropic shape miscounted: %+v", u)
 	}
 }
+
+// A FULL echo cannot prove the merge works: the delta alone already produces the
+// expected totals, so dropping message_start entirely would leave the test
+// above green. This feeds a PARTIAL echo — the delta repeats input_tokens but
+// omits the cache fields, a shape Anthropic has used — so the cache counts
+// survive only if message_start is folded in and only if the fold takes the max
+// per field rather than the latest value.
+func TestAccumulatorPartialEchoKeepsStartCacheCounts(t *testing.T) {
+	start, _, _ := parseAnthropicFrame(`{"type":"message_start","message":{"usage":{"input_tokens":500,"cache_read_input_tokens":200,"cache_creation_input_tokens":40,"output_tokens":1}}}`)
+	delta, _, _ := parseAnthropicFrame(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":500,"output_tokens":77}}`)
+
+	acc := NewAccumulator()
+	acc.Add(start)
+	acc.Add(delta)
+	u := acc.Usage
+
+	// message_start normalizes to Input = 500+200+40 = 740; the delta's partial
+	// echo normalizes to Input = 500. Max keeps 740 — summing would give 1240.
+	if u.InputTokens != 740 {
+		t.Errorf("InputTokens = %d, want 740 (max of the echoed totals, not a sum)", u.InputTokens)
+	}
+	if u.CacheReadTokens != 200 {
+		t.Errorf("CacheReadTokens = %d, want 200 — the delta omitted it, so it must come from message_start", u.CacheReadTokens)
+	}
+	if u.CacheWriteTokens != 40 {
+		t.Errorf("CacheWriteTokens = %d, want 40 — same, recovered from message_start", u.CacheWriteTokens)
+	}
+	if u.OutputTokens != 77 {
+		t.Errorf("OutputTokens = %d, want 77 (message_start's placeholder dropped, delta's accumulated)", u.OutputTokens)
+	}
+}

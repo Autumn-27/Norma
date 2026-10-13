@@ -124,9 +124,22 @@ func (s *ptySession) readSince(c int64, maxLines, maxBytes int, drain bool) (out
 		from, omitted = start, true
 	}
 	seg := s.buf[from-start:]
+	// The ring buffer's base is a raw byte offset, so dropping old output can
+	// leave a partial leading rune. Advance `from` by what we skip: the cursor
+	// must stay equal to the first byte NOT returned, or the next read repeats
+	// or loses output.
+	if omitted {
+		if n := runeSafeStart(seg); n > 0 {
+			from += int64(n)
+			seg = seg[n:]
+		}
+	}
 	if !drain {
 		if maxBytes > 0 && len(seg) > maxBytes {
-			seg = seg[:maxBytes]
+			// Cut on a rune boundary. The bytes held back are not lost: the
+			// returned cursor advances by exactly len(seg), so the next call
+			// resumes at the boundary.
+			seg = seg[:runeSafeLen(seg, maxBytes)]
 		}
 		if maxLines > 0 {
 			if idx := nthByte(seg, '\n', maxLines); idx >= 0 {

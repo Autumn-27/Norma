@@ -15,14 +15,10 @@ func TestCaptureSpillPointerIsAbsolute(t *testing.T) {
 	// A RELATIVE OutputDir under a WorkingDir is the case that used to produce a
 	// relative pointer: it must come back absolute all the same.
 	work := t.TempDir()
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(work); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	// t.Chdir restores the old directory automatically and fails fast if this
+	// test is ever made parallel — process-global cwd and t.Parallel() would
+	// otherwise turn into order-dependent failures elsewhere in the package.
+	t.Chdir(work)
 
 	tc := &ToolContext{WorkingDir: work, OutputDir: "cmd-output", MaxOutputChars: 200}
 	out := Capture(tc, strings.Repeat("z", 5000))

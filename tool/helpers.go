@@ -114,20 +114,39 @@ func truncate(s string, max int) string {
 	return cutHead(s, half) + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", len(s)-max) + cutTail(s, half)
 }
 
-// cutHead returns the longest prefix of s that is at most max bytes AND ends on a
-// rune boundary. max<len(s) is assumed (callers check the length first).
-func cutHead(s string, max int) string {
+// byteSeq is string or []byte: both index to a byte, so the rune-boundary
+// primitives below serve either without converting (and allocating) between them.
+type byteSeq interface{ string | []byte }
+
+// runeSafeLen returns the largest n <= max with b[:n] ending on a rune boundary.
+func runeSafeLen[T byteSeq](b T, max int) int {
 	if max <= 0 {
-		return ""
+		return 0
 	}
-	if len(s) <= max {
-		return s
+	if len(b) <= max {
+		return len(b)
 	}
-	for max > 0 && !utf8.RuneStart(s[max]) {
+	for max > 0 && !utf8.RuneStart(b[max]) {
 		max--
 	}
-	return s[:max]
+	return max
 }
+
+// runeSafeStart returns the smallest n with b[n:] starting on a rune boundary,
+// i.e. the number of leading UTF-8 continuation bytes to drop. Use it when the
+// length is already right and only the boundary is in question — after slicing a
+// ring buffer, or seeking a file to an arbitrary byte offset.
+func runeSafeStart[T byteSeq](b T) int {
+	i := 0
+	for i < len(b) && !utf8.RuneStart(b[i]) {
+		i++
+	}
+	return i
+}
+
+// cutHead returns the longest prefix of s that is at most max bytes AND ends on a
+// rune boundary. max<len(s) is assumed (callers check the length first).
+func cutHead(s string, max int) string { return s[:runeSafeLen(s, max)] }
 
 // cutTail returns the longest suffix of s that is at most max bytes AND starts on
 // a rune boundary.
@@ -138,9 +157,6 @@ func cutTail(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	start := len(s) - max
-	for start < len(s) && !utf8.RuneStart(s[start]) {
-		start++
-	}
-	return s[start:]
+	s = s[len(s)-max:]
+	return s[runeSafeStart(s):]
 }
