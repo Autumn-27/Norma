@@ -107,6 +107,14 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		backend = "ddgs"
 	}
 	client := newFetchClient(WebFetchConfig{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS})
+	// A keyed search request must never follow an endpoint-controlled redirect:
+	// Go retains custom auth headers, and POST redirects can forward the body
+	// containing Tavily's key. Keep the redirecting response for a safe error.
+	if backend != "ddgs" {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
 	switch backend {
 	case "ddgs":
 		return &ddgsProvider{client: client, endpoint: ddgsEndpoint}, nil
@@ -515,6 +523,9 @@ func (p *deepseekProvider) Search(ctx context.Context, query string, limit int) 
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("DeepSeek search redirect refused (HTTP %d)", resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("DeepSeek search returned HTTP %d: %s", resp.StatusCode, truncate(strings.TrimSpace(string(raw)), 300))

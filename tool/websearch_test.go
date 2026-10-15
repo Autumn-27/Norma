@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -114,8 +115,8 @@ func TestBraveHTTPError(t *testing.T) {
 func TestUnwrapDDGHref(t *testing.T) {
 	cases := map[string]string{
 		"//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.com%2Fy&rut=z": "https://x.com/y",
-		"https://plain.example/path":                            "https://plain.example/path",
-		"":                                                      "",
+		"https://plain.example/path":                             "https://plain.example/path",
+		"":                                                       "",
 	}
 	for in, want := range cases {
 		if got := unwrapDDGHref(in); got != want {
@@ -146,6 +147,45 @@ func TestDeepSeekConfigValidation(t *testing.T) {
 		if _, err := NewWebSearch(cfg); err == nil {
 			t.Fatalf("deepseek backend with %s should error", tc.name)
 		}
+	}
+}
+
+func TestKeyedSearchDoesNotFollowRedirects(t *testing.T) {
+	var redirected atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer destination.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", destination.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	for _, backend := range []string{"brave-free", "tavily", "deepseek"} {
+		t.Run(backend, func(t *testing.T) {
+			cfg := WebSearchConfig{Backend: backend, BraveAPIKey: "secret", TavilyAPIKey: "secret",
+				DeepSeekAPIKey: "secret", DeepSeekBaseURL: source.URL, DeepSeekModel: "model"}
+			provider, err := newSearchProvider(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch p := provider.(type) {
+			case *braveProvider:
+				p.endpoint = source.URL
+			case *tavilyProvider:
+				p.endpoint = source.URL
+			case *deepseekProvider:
+				p.endpoint = source.URL
+			}
+			if _, err := provider.Search(context.Background(), "query", 1); err == nil {
+				t.Fatal("redirecting credentialed search should fail")
+			}
+			if n := redirected.Load(); n != 0 {
+				t.Fatalf("credentialed search followed redirect %d times", n)
+			}
+		})
 	}
 }
 
