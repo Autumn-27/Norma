@@ -45,6 +45,22 @@ func TestParseMemCap(t *testing.T) {
 	}
 }
 
+// An overflowing product must be rejected, not wrapped: a wrapped value lands
+// on a negative or zero cap, which memCapBytes reads as "guard disabled" — so a
+// mistyped unit would silently switch the guard off, the one thing the
+// fall-back-to-default rule exists to prevent.
+func TestParseMemCapRejectsOverflow(t *testing.T) {
+	for _, in := range []string{"8388608t", "16777216t", "9223372036854775807g", "99999999999999999999"} {
+		if got, ok := parseMemCap(in); ok {
+			t.Errorf("parseMemCap(%q) = (%d, true), want rejected", in, got)
+		}
+		t.Setenv("AGENT_CORE_TASK_MEM_CAP", in)
+		if got := memCapBytes(); got != defaultMemCap() {
+			t.Errorf("AGENT_CORE_TASK_MEM_CAP=%q yielded %d, want the default %d", in, got, defaultMemCap())
+		}
+	}
+}
+
 func TestMemCapEnvOverride(t *testing.T) {
 	t.Setenv("AGENT_CORE_TASK_MEM_CAP", "64m")
 	if got := memCapBytes(); got != 64<<20 {
@@ -55,11 +71,11 @@ func TestMemCapEnvOverride(t *testing.T) {
 		t.Fatalf("off must disable the guard, got %d", got)
 	}
 	t.Setenv("AGENT_CORE_TASK_MEM_CAP", "bogus")
-	if got := memCapBytes(); got != defaultMemCap {
+	if got := memCapBytes(); got != defaultMemCap() {
 		t.Fatalf("unparseable value must fall back to the default, got %d", got)
 	}
 	t.Setenv("AGENT_CORE_TASK_MEM_CAP", "")
-	if got := memCapBytes(); got != defaultMemCap {
+	if got := memCapBytes(); got != defaultMemCap() {
 		t.Fatalf("unset value must yield the default, got %d", got)
 	}
 }

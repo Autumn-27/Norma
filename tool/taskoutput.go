@@ -64,7 +64,9 @@ func runTaskOutput(ctx context.Context, input json.RawMessage, tc *ToolContext) 
 		return Errorf("Error: " + err.Error()), nil
 	}
 	header := fmt.Sprintf("[task %s | %s", info.ID, info.Status)
-	if info.Status == TaskCompleted || info.Status == TaskFailed {
+	if lbl := terminateLabel(info.Reason); lbl != "" {
+		header += " | " + lbl
+	} else if info.Status == TaskCompleted || info.Status == TaskFailed {
 		header += fmt.Sprintf(" | exit %d", info.ExitCode)
 	}
 	header += "]\n"

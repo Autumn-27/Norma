@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,16 +55,22 @@ const (
 	// staleSessionTTL bounds how long another session's task directory survives
 	// before it is garbage-collected on the next Manager creation.
 	staleSessionTTL = 24 * time.Hour
-	// defaultMemCap bounds one task's process-tree RSS (bytes); the memory
-	// watchdog kills the process group past it (see watchMemory).
-	defaultMemCap = 2 << 30 // 2 GiB
+	// memSampleInterval is the watchdog cadence, shared by the output-size and
+	// memory guards.
+	memSampleInterval = 2 * time.Second
+	// fallbackMemCap is the memory cap used when the host's memory budget
+	// cannot be read at all (see defaultMemCap).
+	fallbackMemCap = 2 << 30 // 2 GiB
+	// minMemCap floors the derived cap: a tiny or misreported budget must not
+	// produce a cap that kills ordinary commands.
+	minMemCap = 512 << 20
 )
 
 // Termination reasons recorded by the watchdogs. An empty reason means a natural
 // exit or a manual Kill — both of which already speak for themselves.
 const (
 	terminateOversize = "oversize" // output file grew past maxTaskOutputBytes
-	terminateMemory   = "memory"   // process-tree RSS grew past the memory cap
+	terminateMemory   = "memory"   // process-group memory grew past the cap
 )
 
 // Task is a single background process tracked by a Manager. Its mutable fields
@@ -248,13 +255,20 @@ func NewManager(sessionID string) (*Manager, error) {
 	}
 	cleanStaleSessions(baseTaskDir(), sessionID)
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Manager{
+	m := &Manager{
 		tasks:      map[string]*Task{},
 		sessions:   map[string]*ptySession{},
 		dir:        dir,
 		rootCtx:    ctx,
 		rootCancel: cancel,
-	}, nil
+	}
+	// One memory watchdog for the whole manager, retired by Cleanup's
+	// rootCancel. A pass over zero running tasks costs nothing, so there is no
+	// reason to start it lazily.
+	if memGuardSupported {
+		go m.memGuard()
+	}
+	return m, nil
 }
 
 // cleanStaleSessions removes sibling session directories older than the TTL —
@@ -378,7 +392,6 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 func (m *Manager) watch(t *Task, f *os.File) {
 	stop := make(chan struct{})
 	go m.watchSize(t, stop)
-	go m.watchMemory(t, stop)
 
 	err := t.cmd.Wait()
 	close(stop)
@@ -408,7 +421,7 @@ func (m *Manager) watch(t *Task, f *os.File) {
 
 // watchSize terminates a task whose output file grows past the cap.
 func (m *Manager) watchSize(t *Task, stop chan struct{}) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(memSampleInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -451,45 +464,108 @@ func (m *Manager) terminate(t *Task, status TaskStatus, reason string) {
 	}
 }
 
-// watchMemory terminates a task whose process tree grows past the memory cap —
-// the twin of watchSize: a task that leaks memory in a loop (an accumulator that
-// never terminates, a scanner that re-reads its own output) must die at a bound
-// instead of dragging the whole host process with it. Sampling is /proc-based
-// and linux-only; elsewhere procTreeRSS reports unavailable and the watchdog
-// stands down.
+// memGuard terminates any task whose process group grows past the memory cap —
+// the twin of watchSize: a task that leaks in a loop (an accumulator that never
+// terminates, a scanner that re-reads its own output) must die at a bound
+// instead of dragging the whole host process with it.
 //
-// The sample is the tree's TOTAL RSS, read every two seconds (the same cadence
-// as watchSize). Between ticks a process may still overshoot the cap by the
-// amount it grows in that window; the bound is a guard, not a wall. A single
-// sample over the cap kills — a runaway stays over on every later sample too,
-// and a command that briefly peaks then frees is one the host should have
-// written differently, not one the guard should learn to excuse.
+// It is ONE goroutine for the whole Manager, not one per task. Sampling reads
+// every process on the host, so its cost is O(host processes) per pass and has
+// nothing to do with how big the watched task is; a pass per task would
+// multiply that by the number of running tasks, and would do it precisely when
+// the host is busiest, since a fork-heavy task raises the process count itself.
+// One pass answers for every task at once.
 //
-// The legacy sync path (runBashSync, no Manager) has no watchdog; hosts that
-// care about the cap route their Bash through the task manager.
-func (m *Manager) watchMemory(t *Task, stop chan struct{}) {
-	cap := memCapBytes()
-	if cap <= 0 || t.cmd.Process == nil {
-		return
-	}
-	ticker := time.NewTicker(2 * time.Second)
+// Each pass is two tiers. The cheap tier sums per-process RSS by process group
+// — one /proc walk, no second file read. RSS double-counts copy-on-write pages,
+// so a parent that forks workers reads several times its real footprint; that
+// is tolerable for a first filter but not for a verdict, because the workloads
+// it over-reports (multiprocessing pools, preforking servers) are ordinary, and
+// killing one would tell the model to rewrite a command that never leaked. So a
+// group over the cap is re-measured with Pss, which splits each shared page
+// across its holders, and only a group over on BOTH is killed. The accurate
+// sample is expensive enough to matter (it walks every mapping under the
+// target's mmap_lock), which is why it runs only here, on the kill path.
+//
+// Between ticks a process may overshoot by whatever it allocates in the window;
+// the bound is a guard, not a wall. Sampling is /proc-based and linux-only;
+// elsewhere memGuardSupported is false and the guard never starts. The legacy
+// sync path (runBashSync, no Manager) has no watchdog either; hosts that care
+// about the cap route their Bash through the task manager.
+func (m *Manager) memGuard() {
+	ticker := time.NewTicker(memSampleInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-stop:
+		case <-m.rootCtx.Done():
 			return
 		case <-ticker.C:
-			total, ok := procTreeRSS(t.cmd.Process)
-			if !ok { // root already gone — the exit path wins the race
-				continue
-			}
-			if total > cap {
-				m.terminate(t, TaskFailed, terminateMemory)
-				return
-			}
+			m.memGuardPass()
 		}
 	}
 }
+
+// memGuardPass runs one two-tier sample over every running task. Split out from
+// memGuard so a test can drive a single pass without waiting on the ticker.
+func (m *Manager) memGuardPass() {
+	limit := memCapBytes()
+	if limit <= 0 {
+		return
+	}
+	// setDetached makes every spawned child the leader of a new process group,
+	// so the group id is the child's own pid — the same handle treeKill uses.
+	m.mu.Lock()
+	watched := make(map[int]*Task, len(m.tasks))
+	for _, t := range m.tasks {
+		if t.Status == TaskRunning && t.cmd != nil && t.cmd.Process != nil {
+			watched[t.cmd.Process.Pid] = t
+		}
+	}
+	m.mu.Unlock()
+	if len(watched) == 0 {
+		return
+	}
+
+	pgids := make([]int, 0, len(watched))
+	for pgid := range watched {
+		pgids = append(pgids, pgid)
+	}
+	for pgid, rss := range pgrpRSS(pgids) {
+		if rss <= limit {
+			continue
+		}
+		// Confirm with the shared-page-aware measure before killing. A group
+		// that is over on RSS but under on Pss is re-confirmed on every later
+		// pass; that costs one accurate sample per tick for as long as it sits
+		// in the band, which is the price of not killing it.
+		if pss, ok := pgrpPSS(pgid); ok && pss <= limit {
+			continue
+		}
+		m.terminate(watched[pgid], TaskFailed, terminateMemory)
+	}
+}
+
+// defaultMemCap is the cap applied when AGENT_CORE_TASK_MEM_CAP is unset. It is
+// derived from the memory a task could actually exhaust rather than fixed at a
+// constant: a 2 GiB literal is at once too low for an ordinary parallel build
+// on a workstation and too high to protect a 1 GiB container. The budget is the
+// cgroup limit when one is set — the number the kernel OOM-kills against —
+// otherwise total host RAM; the cap is 80% of it, leaving headroom for the
+// agent itself and for everything else on the box.
+//
+// Resolved once: the budget does not change over a process's life, and
+// memCapBytes is called on every watchdog tick and in every cap-naming message.
+var defaultMemCap = sync.OnceValue(func() int64 {
+	budget, ok := hostMemBudget()
+	if !ok {
+		return fallbackMemCap
+	}
+	limit := budget / 5 * 4 // 80%, ordered to avoid overflowing on large budgets
+	if limit < minMemCap {
+		return minMemCap
+	}
+	return limit
+})
 
 // memCapBytes returns the per-task memory cap in bytes (defaultMemCap when
 // unset). AGENT_CORE_TASK_MEM_CAP overrides it ("512m", "2g", plain bytes);
@@ -498,11 +574,11 @@ func (m *Manager) watchMemory(t *Task, stop chan struct{}) {
 func memCapBytes() int64 {
 	raw := strings.TrimSpace(os.Getenv("AGENT_CORE_TASK_MEM_CAP"))
 	if raw == "" {
-		return defaultMemCap
+		return defaultMemCap()
 	}
 	v, ok := parseMemCap(raw)
 	if !ok {
-		return defaultMemCap
+		return defaultMemCap()
 	}
 	return v
 }
@@ -538,6 +614,12 @@ func parseMemCap(s string) (int64, bool) {
 	if err != nil || n < 0 {
 		return 0, false
 	}
+	// Reject rather than wrap: an overflowing product lands on a negative or
+	// zero cap, which memCapBytes would read as "guard disabled" — the one
+	// outcome a typo must never produce.
+	if mult > 1 && n > math.MaxInt64/mult {
+		return 0, false
+	}
 	return n * mult, true
 }
 
@@ -562,13 +644,30 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+// terminateLabel renders a watchdog reason for the task-reading tools, naming
+// the cap that fired. It returns "" for a natural exit or a manual kill.
+//
+// These tools would otherwise print the exit code, and a watchdog kill has no
+// meaningful one: terminate flips the status before the SIGKILL lands, so watch
+// skips the exit-code path and the field keeps its zero value. "failed exit=0"
+// is worse than silence — the reason is the only thing that explains the death.
+func terminateLabel(reason string) string {
+	switch reason {
+	case terminateMemory:
+		return "killed: memory cap " + humanBytes(memCapBytes()) + " exceeded"
+	case terminateOversize:
+		return "killed: output cap " + humanBytes(maxTaskOutputBytes) + " exceeded"
+	}
+	return ""
+}
+
 func (m *Manager) notifFor(t *Task) Notification {
 	var sum string
 	switch {
 	case t.reason == terminateOversize:
 		sum = fmt.Sprintf("Task %q 输出超过上限已被终止 (%s)。", short(t.Command), t.Kind)
 	case t.reason == terminateMemory:
-		sum = fmt.Sprintf("Task %q 内存占用超过单条命令上限 %s，进程树已被终止。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), humanBytes(memCapBytes()))
+		sum = fmt.Sprintf("Task %q 内存占用超过单条命令上限 %s，进程组已被终止。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), humanBytes(memCapBytes()))
 	case t.Status == TaskCompleted:
 		sum = fmt.Sprintf("Task %q 已完成 (exit %d)。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), t.ExitCode)
 	case t.Status == TaskFailed:

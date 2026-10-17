@@ -31,7 +31,9 @@ func runTaskList(_ context.Context, _ json.RawMessage, tc *ToolContext) (Result,
 	var b strings.Builder
 	for _, t := range tasks {
 		fmt.Fprintf(&b, "%s [%s] %s", t.ID, t.Kind, t.Status)
-		if t.Status == TaskCompleted || t.Status == TaskFailed {
+		if lbl := terminateLabel(t.Reason); lbl != "" {
+			fmt.Fprintf(&b, " (%s)", lbl)
+		} else if t.Status == TaskCompleted || t.Status == TaskFailed {
 			fmt.Fprintf(&b, " exit=%d", t.ExitCode)
 		}
 		fmt.Fprintf(&b, "  %s\n", short(t.Command))
