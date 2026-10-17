@@ -310,7 +310,9 @@ func NewSession(opts Options) *Session {
 	}
 	// Background task execution: a per-session manager plus the tools that read and
 	// control it. Disabled by the global AGENT_CORE_DISABLE_BACKGROUND_TASKS env var
-	// or by setting Options.DisableBackgroundTasks for this session only.
+	// or by setting Options.DisableBackgroundTasks for this session only. Every
+	// spawned task is also bounded by a per-task memory cap
+	// (AGENT_CORE_TASK_MEM_CAP) that kills the process group of a leaking command.
 	if !tool.BackgroundTasksDisabled() && !opts.DisableBackgroundTasks {
 		if mgr, err := tool.NewManager(s.sessionID); err == nil {
 			s.tasks = mgr
