@@ -99,10 +99,14 @@ func DefaultConfig(modelContextLimit int) Config {
 			MaxContextLimitPct:    0.75,
 			MinContextLimitPct:    0.45,
 			EmergencyThresholdPct: 0.95,
+			// The band must have width, or GrowthRatio can never move the
+			// result and "adaptive" growth is a constant: a 40K window then paces
+			// itself exactly like a 400K one, and the small one overflows before
+			// its cadence gate ever opens.
 			GrowthRatio:           0.05,
-			GrowthFloor:           50_000,
-			GrowthCap:             50_000,
-			MinGrowthFloor:        20_000,
+			GrowthFloor:           1_000,
+			GrowthCap:             20_000,
+			MinGrowthFloor:        10_000,
 			MinGrowthRatio:        0.45,
 			Tier2GrowthMultiplier: 1.5,
 		},

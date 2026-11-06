@@ -124,13 +124,53 @@ func DecideNudge(in DecideNudgeInput) NudgeDecision {
 	return d
 }
 
-// decidePressure picks the tier with the most to reclaim, subject to the
-// minimum-benefit floor.
+// decidePressure picks a tier to compress under pressure.
+//
+// The default rule is "reclaim the most tokens this turn", which always names
+// tier 1: it is raw content, while tier 2 is the ~10:1 summary of it. That rule
+// therefore never consolidates, and the block count grows without bound — a
+// session living in the pressure band ends up with dozens of tier-1 blocks and
+// no tier 2 at all.
+//
+// The count triggers that exist to prevent exactly this lived only in
+// decideGrowth, which the pressure path skips. They are applied here first: once
+// enough lower-tier blocks exist, consolidating them is the job, even though it
+// reclaims fewer tokens than compressing more raw content would.
 func decidePressure(d *NudgeDecision, tiers map[Tier]tierPending, cfg Config, minBen int) {
 	candidates := []Tier{1}
 	if cfg.Tiers.Enabled {
 		candidates = append(candidates, 2, 3)
 	}
+
+	// Consolidation first, by count — but only once the summaries it would fold
+	// are themselves worth the turn. Reclaiming raw content is strictly better
+	// per token, so taking consolidation too early starves the reclaim loop and
+	// the view grows instead of shrinking.
+	if cfg.Tiers.Enabled {
+		for _, t := range []Tier{2, 3} {
+			trigger := cfg.Tiers.Tier2Trigger
+			if t == 3 {
+				trigger = cfg.Tiers.Tier3Trigger
+			}
+			// The summaries a consolidation folds are ~10x smaller than the raw
+			// content they replaced, so the full minimum-benefit floor would
+			// never be cleared and the block count would grow unbounded. Half of
+			// it, floored at 1% of the window, is the point where folding them
+			// starts to matter.
+			// Fold them once they outweigh what is left to reclaim: reclaiming raw
+			// content is strictly better per token, so consolidation is only the
+			// right move when there is less raw content left than summary to fold.
+			if tiers[t].count >= trigger && len(tiers[t].blocks) > 0 && tiers[t].pending >= tiers[1].pending {
+				d.ShouldInject = true
+				d.Tier = t
+				d.TierTargetBlocks = tiers[t].blocks
+				d.Reason = fmt.Sprintf("pressure at %.0f%%: %d block(s) ready to consolidate into tier %d; %s",
+					d.ContextUsage*100, tiers[t].count, t, pendingSummary(tiers))
+				return
+			}
+		}
+	}
+
 	best, bestPending := Tier(0), -1
 	for _, t := range candidates {
 		if tiers[t].pending > bestPending {
@@ -158,12 +198,45 @@ func decideGrowth(d *NudgeDecision, in DecideNudgeInput, tiers map[Tier]tierPend
 	cfg Config, adaptive, floor int) {
 
 	tier2Threshold := roundHalfUp(float64(adaptive) * cfg.Nudge.Tier2GrowthMultiplier)
-	// Count-based tier triggers also need a usage floor. Without it a session
-	// with a handful of blocks but a nearly empty context would spend a turn
-	// consolidating for no benefit.
 	usageFloor := cfg.Nudge.MinContextLimitPct
-	t2CountReady := tiers[2].count >= cfg.Tiers.Tier2Trigger && d.ContextUsage >= usageFloor
-	t3CountReady := tiers[3].count >= cfg.Tiers.Tier3Trigger && d.ContextUsage >= usageFloor
+
+	// Consolidation that has crossed its count trigger goes first. Raw content is
+	// worth more per token, so "tier 1 has pending" would otherwise win every
+	// time and the block count would grow without bound — a session can sit at a
+	// quarter full with a hundred summaries and never consolidate.
+	//
+	// The count trigger is held back by a usage floor (with five blocks in a
+	// nearly empty context, folding them buys nothing). A block count at twice
+	// the trigger overrides that floor: then the thing being bounded IS the
+	// block count, whatever the usage says.
+	t2CountReady := tiers[2].count >= cfg.Tiers.Tier2Trigger &&
+		(d.ContextUsage >= usageFloor || tiers[2].count >= 2*cfg.Tiers.Tier2Trigger)
+	t3CountReady := tiers[3].count >= cfg.Tiers.Tier3Trigger &&
+		(d.ContextUsage >= usageFloor || tiers[3].count >= 2*cfg.Tiers.Tier3Trigger)
+
+	var blockedTier Tier
+	if cfg.Tiers.Enabled {
+		for _, ready := range []struct {
+			ok   bool
+			tier Tier
+		}{{t2CountReady && len(tiers[2].blocks) > 0, 2}, {t3CountReady && len(tiers[3].blocks) > 0, 3}} {
+			if !ready.ok {
+				continue
+			}
+			if !tierCadenceReady(in.State, ready.tier, in.TokenCount, floor) {
+				// Paced. Tier 1 may still have work this turn, so do not stop
+				// here — but remember why, in case nothing else fires.
+				blockedTier = ready.tier
+				continue
+			}
+			d.ShouldInject = true
+			d.Tier = ready.tier
+			d.TierTargetBlocks = tiers[ready.tier].blocks
+			d.Reason = fmt.Sprintf("growth: tier %d ready (%d block(s), %d pending); %s",
+				ready.tier, tiers[ready.tier].count, tiers[ready.tier].pending, pendingSummary(tiers))
+			return
+		}
+	}
 
 	if tiers[1].pending >= adaptive {
 		d.ShouldInject = true
@@ -172,7 +245,7 @@ func decideGrowth(d *NudgeDecision, in DecideNudgeInput, tiers map[Tier]tierPend
 		return
 	}
 	if cfg.Tiers.Enabled {
-		if t2CountReady || (tiers[2].pending >= tier2Threshold && tiers[2].pending > tiers[1].pending) {
+		if tiers[2].pending >= tier2Threshold && tiers[2].pending > tiers[1].pending {
 			if tierCadenceReady(in.State, 2, in.TokenCount, floor) {
 				d.ShouldInject = true
 				d.Tier = 2
@@ -184,8 +257,8 @@ func decideGrowth(d *NudgeDecision, in DecideNudgeInput, tiers map[Tier]tierPend
 			d.Reason = "blocked: T2 (cadence); " + pendingSummary(tiers)
 			return
 		}
-		if t3CountReady || (tiers[3].pending >= tier2Threshold &&
-			tiers[3].pending > tiers[2].pending && tiers[3].pending > tiers[1].pending) {
+		if tiers[3].pending >= tier2Threshold &&
+			tiers[3].pending > tiers[2].pending && tiers[3].pending > tiers[1].pending {
 			if tierCadenceReady(in.State, 3, in.TokenCount, floor) {
 				d.ShouldInject = true
 				d.Tier = 3
@@ -197,6 +270,10 @@ func decideGrowth(d *NudgeDecision, in DecideNudgeInput, tiers map[Tier]tierPend
 			d.Reason = "blocked: T3 (cadence); " + pendingSummary(tiers)
 			return
 		}
+	}
+	if blockedTier > 0 {
+		d.Reason = fmt.Sprintf("blocked: T%d (cadence); %s", blockedTier, pendingSummary(tiers))
+		return
 	}
 	d.Reason = "growth ready but no tier qualifies; " + pendingSummary(tiers)
 }
@@ -321,8 +398,19 @@ func stampNudge(state *CompressionState, cfg Config, tokenCount int, d NudgeDeci
 }
 
 // NudgeGrowthFloor is the cadence step a host uses to decide when a suppressed
-// nudge may resume. Reusing the same unit the pacing already speaks in keeps
-// the behaviour predictable and avoids one more knob to tune.
+// nudge may resume.
+//
+// It is the pacing unit, clamped to a tenth of the window. The two jobs pull in
+// opposite directions and cannot share one number: the cadence gate wants to be
+// large (do not nag), while the release wants to be small — suppression engages
+// in the pressure band, so a step that is a big share of the window can never
+// complete before the request overflows, and nudging stays silent exactly when
+// it matters most. The clamp is what makes "resume after a failure" always
+// reachable.
 func NudgeGrowthFloor(cfg Config) int {
-	return growthFloorOf(resolveAdaptiveGrowth(cfg.ModelContextLimit, cfg.Nudge), cfg.Nudge)
+	floor := growthFloorOf(resolveAdaptiveGrowth(cfg.ModelContextLimit, cfg.Nudge), cfg.Nudge)
+	if cap := cfg.ModelContextLimit / 10; cap > 0 && floor > cap {
+		return cap
+	}
+	return floor
 }

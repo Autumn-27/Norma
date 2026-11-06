@@ -37,8 +37,22 @@ func (c *Compactor) View(_ context.Context, msgs []llm.Message) []llm.Message {
 // IsOverflow reports whether err is a context-overflow rejection. The built-in
 // compaction already recognises every provider's phrasing, so the detection is
 // borrowed rather than duplicated.
+// IsOverflow reports whether err is a prompt-too-long failure.
+//
+// It is also the one place that sees the error text, so it is where the real
+// window is learned: a proxy or deployment often trims the window below the
+// configured one, and re-guessing the same number next turn fails the same way.
+// Without this the armed floor always falls back to the CONFIGURED limit — the
+// exact number the provider just rejected.
 func (c *Compactor) IsOverflow(err error) bool {
-	return compaction.New(compaction.Config{}, nil).IsOverflow(err)
+	if err == nil {
+		return false
+	}
+	is := compaction.New(compaction.Config{}, nil).IsOverflow(err)
+	if is {
+		c.overflow.learn(ParseOverflowWindow(err.Error()))
+	}
+	return is
 }
 
 // Reactive recovers from a prompt-too-long error.

@@ -99,41 +99,66 @@ func MessagesForAPI(msgs []Message) []Message {
 	return PairToolBlocks(out)
 }
 
-// PairToolBlocks drops tool blocks left unpaired within msgs: a tool_result
-// whose tool_use is absent, or a tool_use whose tool_result is absent. The
-// working set is sliced at the last boundary, and that cut can fall inside a
-// tool exchange — leaving the post-boundary view starting with a tool_result
-// whose tool_use was summarized away (or ending with a tool_use whose result
-// is beyond the tail). Sent verbatim, the first makes the gateway 400 ("a
-// message with role 'tool' must be a response to a preceding message with
-// 'tool_calls'"). Well-formed histories have no unpaired blocks and pass through
-// unchanged; this also repairs a resumed transcript that already baked in an
-// orphan from an earlier compaction. Drops (not synthesizes), matching the
-// summarizer's pairForReplay.
+// PairToolBlocks drops tool blocks that do not form a well-shaped exchange
+// within msgs. A strict provider rejects the whole request over any of these, and
+// all three break the same way — with a 400 that names the tool calls, not the
+// cause:
+//
+//   - only one half present (the usual result of a cut at a block boundary);
+//   - both halves present but the result lands BEFORE its declaration;
+//   - both halves present but a message sits between them;
+//   - the id appears twice on either side, so nothing says which result answers
+//     which call.
+//
+// The first case is what this function used to handle. Existence alone is not
+// enough: every other case has both halves, so an existence check waves them
+// through, which is how a compacted history reached a provider in an order it
+// refuses.
+//
+// Well-formed histories pass through unchanged. Damaged exchanges are dropped
+// whole (not repaired, not reordered) — a guessed order is worse than a hole,
+// and the alternative is failing every turn of the session.
 func PairToolBlocks(msgs []Message) []Message {
-	useIDs := make(map[string]bool)
-	resIDs := make(map[string]bool)
-	for _, m := range msgs {
-		for _, b := range m.Content {
+	type occurrence struct{ msg, block int }
+	uses := make(map[string][]occurrence)
+	results := make(map[string][]occurrence)
+	for i, m := range msgs {
+		for j, b := range m.Content {
 			switch b.Type {
 			case BlockToolUse:
-				useIDs[b.ID] = true
+				uses[b.ID] = append(uses[b.ID], occurrence{i, j})
 			case BlockToolResult:
-				resIDs[b.ToolUseID] = true
+				results[b.ToolUseID] = append(results[b.ToolUseID], occurrence{i, j})
 			}
 		}
 	}
+
+	valid := make(map[string]bool, len(uses))
+	for id, u := range uses {
+		r, ok := results[id]
+		if !ok || len(u) != 1 || len(r) != 1 {
+			continue // missing, or ambiguous because the id repeats
+		}
+		if u[0].msg >= r[0].msg {
+			continue // the result precedes the call it answers
+		}
+		if !onlyToolResultsBetween(msgs, u[0].msg+1, r[0].msg) {
+			continue // something that is not a tool result sits in between
+		}
+		valid[id] = true
+	}
+
 	out := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
 		kept := make([]ContentBlock, 0, len(m.Content))
 		for _, b := range m.Content {
 			switch b.Type {
 			case BlockToolUse:
-				if !resIDs[b.ID] {
+				if !valid[b.ID] {
 					continue
 				}
 			case BlockToolResult:
-				if !useIDs[b.ToolUseID] {
+				if !valid[b.ToolUseID] {
 					continue
 				}
 			}
@@ -144,4 +169,25 @@ func PairToolBlocks(msgs []Message) []Message {
 		}
 	}
 	return out
+}
+
+// onlyToolResultsBetween reports whether every block of every message in
+// [from, to) is a tool result. A parallel batch fills consecutive messages with
+// results, so that run is legal; anything else in the gap means the exchange is
+// no longer contiguous and providers reject it.
+func onlyToolResultsBetween(msgs []Message, from, to int) bool {
+	if from < 0 {
+		from = 0
+	}
+	if to > len(msgs) {
+		to = len(msgs)
+	}
+	for i := from; i < to; i++ {
+		for _, b := range msgs[i].Content {
+			if b.Type != BlockToolResult {
+				return false
+			}
+		}
+	}
+	return true
 }

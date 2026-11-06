@@ -18,9 +18,12 @@ func TestDefaultConfigMatchesSpec(t *testing.T) {
 		{"MaxContextLimitPct", c.Nudge.MaxContextLimitPct, 0.75},
 		{"MinContextLimitPct", c.Nudge.MinContextLimitPct, 0.45},
 		{"EmergencyThresholdPct", c.Nudge.EmergencyThresholdPct, 0.95},
-		{"GrowthFloor", c.Nudge.GrowthFloor, 50000},
-		{"GrowthCap", c.Nudge.GrowthCap, 50000},
-		{"MinGrowthFloor", c.Nudge.MinGrowthFloor, 20000},
+		// The band must have width: GrowthRatio (5%) is the actual pacing rule,
+		// the clamp only keeps it sane at the extremes. Equal floor and cap made
+		// the adaptive growth a constant (see TestAdaptiveGrowthTracksTheWindow).
+		{"GrowthFloor", c.Nudge.GrowthFloor, 1000},
+		{"GrowthCap", c.Nudge.GrowthCap, 20000},
+		{"MinGrowthFloor", c.Nudge.MinGrowthFloor, 10000},
 		{"MinGrowthRatio", c.Nudge.MinGrowthRatio, 0.45},
 		{"Tier2GrowthMultiplier", c.Nudge.Tier2GrowthMultiplier, 1.5},
 		{"Truncate.Threshold", c.Truncate.Threshold, 0.95},

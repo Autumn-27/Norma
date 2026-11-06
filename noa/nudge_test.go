@@ -27,9 +27,11 @@ func nudgeAt(t *testing.T, tokenCount, t1Tokens int, mutate func(*CompressionSta
 
 func TestResolveAdaptiveGrowth(t *testing.T) {
 	n := DefaultConfig(200000).Nudge
-	// min(50000, max(50000, round(200000*0.05)=10000)) = 50000
-	if got := resolveAdaptiveGrowth(200000, n); got != 50000 {
-		t.Fatalf("adaptive growth for a 200k window = %d, want 50000", got)
+	// min(20000, max(1000, round(200000*0.05)=10000)) = 10000 — the ratio, not
+	// the clamp, is what decides. A band of zero width would return 50000 here
+	// for every window.
+	if got := resolveAdaptiveGrowth(200000, n); got != 10000 {
+		t.Fatalf("adaptive growth for a 200k window = %d, want 10000 (5%% of the window)", got)
 	}
 	if got := resolveAdaptiveGrowth(0, n); got != n.GrowthFloor {
 		t.Fatalf("adaptive growth with no limit = %d, want the floor", got)
@@ -38,9 +40,9 @@ func TestResolveAdaptiveGrowth(t *testing.T) {
 
 func TestGrowthFloor(t *testing.T) {
 	n := DefaultConfig(200000).Nudge
-	// max(20000, 0.45*50000=22500) = 22500
-	if got := growthFloorOf(50000, n); got != 22500 {
-		t.Fatalf("growth floor = %d, want 22500", got)
+	// max(MinGrowthFloor=10000, 0.45*20000=9000) = 10000
+	if got := growthFloorOf(20000, n); got != 10000 {
+		t.Fatalf("growth floor = %d, want 10000", got)
 	}
 }
 

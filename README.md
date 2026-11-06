@@ -6,7 +6,7 @@ You point it at any model (via the **Anthropic** *or* **OpenAI** wire format), d
 
 **What you get out of the box:** dual-format streaming, a fail-closed tool system with the standard file/shell toolset, a four-stage permission pipeline, automatic context-window management, lifecycle hooks, subagents, MCP, plan mode, long-term memory, a skill system, background tasks, and multi-agent coordination — all behind one stateful `Session`.
 
-Module path: `github.com/Autumn-27/norma` · Go 1.23+ (uses `iter`).
+Module path: `github.com/Autumn-27/norma` · Go 1.26.3+ (the `go` directive in `go.mod`).
 
 ## Packages
 
@@ -25,6 +25,30 @@ Module path: `github.com/Autumn-27/norma` · Go 1.23+ (uses `iter`).
 | `skill` | Named, reusable instruction packages loaded from `SKILL.md` files (YAML frontmatter — `name`/`description`/`license`/`compatibility`/`mcps` — plus a Markdown body). A `Skill` tool injects a chosen skill's procedure on demand as standing guidance that survives compaction, and can unlock a skill's declared MCP tools on invocation. |
 | `coordinator` | Coordinator mode: a top-level agent that decomposes work and delegates to isolated `worker` subagents — LLM-driven (Agent tool + system segment) or programmatic (`RunParallel` fan-out). |
 | `agentcore` | The public entry point: a stateful `Session` whose `Prompt` streams the loop, plus a one-shot `Run`. Aggregates everything above, and optionally persists an append-only JSONL transcript so a session can be resumed (`Session.Resume`). |
+| `noa` | A **model-driven** alternative to `compaction`: the working model decides which ranges to fold and writes the summary itself, through one `Compress` tool. A pure core with no model calls and no I/O — refs, block state, tiers, boundary and tool-pair integrity, pacing, and archive rendering. |
+| `noaadapter` | Wires `noa` into Norma: projects host messages, rebuilds the request view, exposes the `Compress` tool, persists `state.json`, and implements `harness.Compactor`/`ContextView`. Opt-in; see below. |
+
+## Context compression: two options
+
+`compaction` (default) calls a separate summarizer model and replaces old messages with its summary. It needs no cooperation from the agent and always runs.
+
+`noa` is the second option, for hosts that want the agent itself to decide what its history should say:
+
+- the model chooses the range and writes the summary (`Compress {startId, endId, summary}`);
+- the originals are archived to disk first, so the summary carries a path the model can `Read` back;
+- tier 1 folds raw messages, tier 2 folds the tier-1 summaries, tier 3 folds those — so the number of summaries stays bounded;
+- nudges pace the work: the model is asked to compress when the context crosses 75%, not on its own initiative.
+
+```go
+opts := agentcore.Options{ /* … */ }
+if err := noaadapter.Enable(&opts, noaadapter.Options{
+    ArchiveBaseDir: "~/.cache/myapp/noa",
+    SessionID:      sessionID,
+}); err != nil { … }
+opts.Compaction = nil // optional: a set Compactor wins anyway, this just avoids the warning
+```
+
+It is opt-in and off by default, and every hook it uses is inert until enabled. The trade is real: it needs a cooperative model, and a model that never calls `Compress` falls back to the mechanical valve (emergency truncation) rather than to summaries.
 
 ## Quick start
 
@@ -81,4 +105,4 @@ Coverage: both provider adapters over `httptest` SSE; the loop end-to-end with a
 
 ## Scope
 
-Implements the core loop, dual providers, tools, the full permission pipeline, compaction, hooks, subagents, and MCP — plus plan mode, long-term memory, the skill system, background tasks, deferred tools, transcript persistence with resume, and coordinator multi-agent orchestration.
+Implements the core loop, dual providers, tools, the full permission pipeline, compaction, hooks, subagents, and MCP — plus plan mode, long-term memory, the skill system, background tasks, deferred tools, transcript persistence with resume, coordinator multi-agent orchestration, and the opt-in `noa` model-driven context compression.
