@@ -41,6 +41,13 @@ func Enable(opts *agentcore.Options, o Options) error {
 	}
 
 	opts.Compactor = &Compactor{sess: sess}
+	// NewSession reads a nil Tools as "use the defaults". Appending to nil makes
+	// a one-element slice, so the whole default toolset (Read, Write, Edit, Bash,
+	// Glob, Grep…) would be dropped — silently, and only for hosts that enable
+	// noa without listing tools themselves. Fill the default in first.
+	if opts.Tools == nil {
+		opts.Tools = tool.DefaultTools()
+	}
 	opts.Tools = append(opts.Tools, newCompressTool(sess))
 	opts.AppendSystemPrompt = append(opts.AppendSystemPrompt, noa.BuildSystemPrompt(noa.Sections{}))
 	// The prompt section is fully static, so it belongs in the cacheable prefix.

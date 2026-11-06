@@ -141,3 +141,35 @@ func TestBuildBodyAppliesSendGuard(t *testing.T) {
 		t.Fatalf("unanswered tool_call was sent: %s", s)
 	}
 }
+
+// A thinking provider that turns itself on (DeepSeek V4 defaults to it) emits
+// reasoning_content for some assistant turns and rejects the whole history once
+// one of them replays without it. Config cannot see that, so the history is the
+// signal: if any assistant message carries reasoning, the missing ones are filled.
+func TestSanitizeFillsReasoningForTextOnlyTurns(t *testing.T) {
+	msgs := []oaMessage{
+		{Role: "assistant", ReasoningContent: "thought", ToolCalls: []oaToolCall{oaCall("a")}},
+		{Role: "tool", ToolCallID: "a", Content: "ok"},
+		{Role: "assistant", Content: "a text-only answer"},
+	}
+	got := sanitizeOpenAIMessages(msgs, false)
+	if got[2].ReasoningContent == "" {
+		t.Fatalf("text-only assistant turn lost reasoning_content while the history replays it elsewhere")
+	}
+	if got[2].Content != "a text-only answer" {
+		t.Fatalf("content = %q, want it untouched", got[2].Content)
+	}
+}
+
+// The mirror image: a history with no reasoning at all must not gain any, or
+// every non-thinking endpoint starts rejecting an unknown field.
+func TestSanitizeLeavesReasoningFreeHistoryAlone(t *testing.T) {
+	msgs := []oaMessage{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello"},
+	}
+	got := sanitizeOpenAIMessages(msgs, false)
+	if got[1].ReasoningContent != "" {
+		t.Fatalf("reasoning_content = %q, want empty", got[1].ReasoningContent)
+	}
+}

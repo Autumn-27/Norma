@@ -531,7 +531,12 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		for ev, err := range inner {
 			if ev.Kind == harness.KindResult && ev.Terminal != nil {
 				s.messages = ev.Terminal.Messages
-				s.usage = ev.Terminal.Usage
+				// Terminal.Usage is cumulative for THIS Prompt; the Session's is the
+				// running total for the session, which is what Usage() promises and
+				// what Resume() restores. Assigning would throw away everything
+				// spent before this turn, so a resumed session would report only the
+				// last Prompt and a long one would report only the last turn.
+				s.usage.Add(ev.Terminal.Usage)
 			}
 			if !yield(ev, err) {
 				return

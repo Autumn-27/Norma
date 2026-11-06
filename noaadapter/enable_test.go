@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -79,6 +80,29 @@ func TestNotEnablingLeavesOptionsUntouched(t *testing.T) {
 
 // The archive is the only route back to compressed originals, so its location
 // must be the host's explicit decision — never a silent fallback.
+// A host that enables noa without listing tools still wants the standard ones.
+// Options.Tools nil means "use the defaults"; appending Compress to nil made a
+// one-element slice, so the nil check in NewSession never fired and the agent
+// came up with Compress and nothing else — no Read, no Bash, no Write.
+func TestEnableKeepsTheDefaultToolsetWhenNoneGiven(t *testing.T) {
+	opts := baseOptions()
+	opts.Tools = nil
+	if err := Enable(&opts, Options{ArchiveBaseDir: t.TempDir(), SessionID: "s1"}); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+
+	want := len(tool.DefaultTools()) + 1
+	if len(opts.Tools) != want {
+		t.Fatalf("tools = %v (%d), want the %d defaults plus Compress",
+			toolNames(opts.Tools), len(opts.Tools), want)
+	}
+	for _, name := range []string{"Read", "Bash", "Compress"} {
+		if !slices.Contains(toolNames(opts.Tools), name) {
+			t.Fatalf("tool %q missing; tools = %v", name, toolNames(opts.Tools))
+		}
+	}
+}
+
 func TestEnableRequiresArchiveDir(t *testing.T) {
 	opts := baseOptions()
 	err := Enable(&opts, Options{SessionID: "s1"})

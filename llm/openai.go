@@ -170,6 +170,27 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 // preserved by the compaction layer, so this path is a last resort.
 const reasoningElidedPlaceholder = "(reasoning elided by context compaction)"
 
+// seedMissingReasoning fills reasoning_content on assistant messages that lost it,
+// but only when the request already replays reasoning in another assistant
+// message — the signal that this endpoint is in thinking mode.
+func seedMissingReasoning(msgs []oaMessage) {
+	replays := false
+	for _, m := range msgs {
+		if m.Role == "assistant" && m.ReasoningContent != "" {
+			replays = true
+			break
+		}
+	}
+	if !replays {
+		return
+	}
+	for i := range msgs {
+		if msgs[i].Role == "assistant" && msgs[i].ReasoningContent == "" {
+			msgs[i].ReasoningContent = reasoningElidedPlaceholder
+		}
+	}
+}
+
 // sanitizeOpenAIMessages enforces, at the provider boundary, the two structural
 // invariants OpenAI-compatible endpoints validate — regardless of what produced
 // req.Messages (noa compaction, the built-in compactor, or a host that assembled
@@ -225,6 +246,15 @@ func sanitizeOpenAIMessages(msgs []oaMessage, thinking bool) []oaMessage {
 			}
 		}
 	}
+	// A provider that accepted reasoning_content on one assistant message demands
+	// it on all of them (DeepSeek: "The `reasoning_content` in the thinking mode
+	// must be passed back"). Model a provider that turns thinking on by itself —
+	// config says nothing about it — the flag above is false, and this is the only
+	// place that can see the history already replays reasoning. Fill the gaps only
+	// in that case: a request with no reasoning anywhere is left untouched, so a
+	// non-thinking endpoint never sees the field.
+	seedMissingReasoning(msgs)
+
 	out := make([]oaMessage, 0, len(msgs))
 	for _, m := range msgs {
 		if m.Role == "tool" && m.ToolCallID != "" && !surviving[m.ToolCallID] {
