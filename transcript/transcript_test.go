@@ -3,6 +3,7 @@ package transcript
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Autumn-27/norma/llm"
@@ -157,17 +158,23 @@ func TestNewIDsAreDistinctAndNonEmpty(t *testing.T) {
 	}
 }
 
-func TestLoadCorruptLineErrors(t *testing.T) {
+// The last line is the one an interrupted append tears, so it is dropped; the
+// intact prefix still loads. Damage before the end is a separate test
+// (TestCorruptMiddleLineStillFails) because that one must not be silent.
+func TestLoadCorruptTailIsTolerated(t *testing.T) {
 	s := NewStore(t.TempDir())
 	path := s.MainPath("sess")
-	// Write a valid record, then a corrupt (non-JSON) line.
 	w := s.NewWriter("sess", "")
 	w.RecordMessage(llm.UserText("ok"), llm.Usage{})
 	if err := appendRaw(path, "{not valid json\n"); err != nil {
 		t.Fatalf("setup append: %v", err)
 	}
-	if _, err := s.Load(path); err == nil {
-		t.Fatal("Load should error on a corrupt line")
+	recs, err := s.Load(path)
+	if err != nil {
+		t.Fatalf("a corrupt tail must not fail the load: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("want the intact record only, got %d", len(recs))
 	}
 }
 
@@ -180,4 +187,58 @@ func appendRaw(path, line string) error {
 	defer f.Close()
 	_, err = f.WriteString(line)
 	return err
+}
+
+// An interrupted append leaves half a line at the end of the file. That must
+// cost the torn record, not the whole conversation.
+func TestTornTailIsDropped(t *testing.T) {
+	s := NewStore(t.TempDir())
+	w := s.NewWriter("sess", "")
+	w.RecordMessage(llm.UserText("first"), llm.Usage{})
+	w.RecordMessage(llm.UserText("second"), llm.Usage{})
+	path := s.MainPath("sess")
+	if err := w.Err(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"type":"message","message":{"role":"user","con`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	recs, err := s.Load(path)
+	if err != nil {
+		t.Fatalf("a torn tail must not fail the load: %v", err)
+	}
+	msgs, _ := Messages(recs)
+	if len(msgs) != 2 || msgs[0].Text() != "first" || msgs[1].Text() != "second" {
+		t.Fatalf("the two intact records should survive, got %d: %+v", len(msgs), msgs)
+	}
+}
+
+// Damage in the middle is not a torn tail; it must still fail loudly.
+func TestCorruptMiddleLineStillFails(t *testing.T) {
+	s := NewStore(t.TempDir())
+	w := s.NewWriter("sess", "")
+	w.RecordMessage(llm.UserText("first"), llm.Usage{})
+	w.RecordMessage(llm.UserText("second"), llm.Usage{})
+	path := s.MainPath("sess")
+	_ = w.Err()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	lines[0] = `{"type":` // corrupt the first of two
+	broken := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(path); err == nil {
+		t.Fatal("a corrupt line before the end must be an error")
+	}
 }

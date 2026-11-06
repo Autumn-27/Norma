@@ -30,7 +30,7 @@ func NewGlob() CoreTool {
 		},
 		ReadOnly:    always,
 		Concurrent:  always,
-		Permissions: allowReadOnly,
+		Permissions: readPathPermissions,
 		Run:         runGlob,
 	})
 }
@@ -161,7 +161,7 @@ func NewGrep() CoreTool {
 		},
 		ReadOnly:    always,
 		Concurrent:  always,
-		Permissions: allowReadOnly,
+		Permissions: readPathPermissions,
 		Run:         runGrep,
 	})
 }

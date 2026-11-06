@@ -100,6 +100,11 @@ func (s *Store) Append(path string, recs ...Record) error {
 
 // Load reads all records from a transcript file. A missing file yields no
 // records and no error (a fresh session).
+//
+// One damaged line is tolerated, but only the LAST one: an append that was cut
+// off mid-write leaves a torn tail, and refusing the whole file for it would turn
+// one interrupted write into the loss of every session on disk. A corrupt line in
+// the middle is real damage and still fails loudly.
 func (s *Store) Load(path string) ([]Record, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -109,21 +114,49 @@ func (s *Store) Load(path string) ([]Record, error) {
 		return nil, err
 	}
 	defer f.Close()
+
 	var recs []Record
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024) // tolerate large tool results
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
+
+	// One line of lookahead: a line can only be known to be the last after the one
+	// after it has been read, and holding the whole file in memory to find out is
+	// not worth it.
+	var pending []byte
+	hasPending := false
+	flush := func(line []byte, last bool) error {
 		var r Record
 		if err := json.Unmarshal(line, &r); err != nil {
-			return nil, fmt.Errorf("transcript: corrupt line: %w", err)
+			if last {
+				return nil // torn tail: drop it, keep the rest
+			}
+			return fmt.Errorf("transcript: corrupt line %d: %w", len(recs)+1, err)
 		}
 		recs = append(recs, r)
+		return nil
 	}
-	return recs, sc.Err()
+
+	for sc.Scan() {
+		if hasPending {
+			if err := flush(pending, false); err != nil {
+				return nil, err
+			}
+			hasPending = false
+		}
+		if line := sc.Bytes(); len(line) > 0 {
+			pending = append(pending[:0], line...)
+			hasPending = true
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if hasPending {
+		if err := flush(pending, true); err != nil {
+			return nil, err
+		}
+	}
+	return recs, nil
 }
 
 // Messages reconstructs the raw conversation and cumulative usage from records.

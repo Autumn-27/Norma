@@ -1,6 +1,8 @@
 package tool
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Autumn-27/norma/permission"
 )
 
 const defaultMaxOutput = 30000
@@ -44,9 +48,25 @@ func Capture(tc *ToolContext, s string) string {
 	if tc != nil && tc.OutputDir != "" {
 		if path, err := spillOutput(tc.OutputDir, s); err == nil {
 			lines := strings.Count(s, "\n") + 1
-			return cutHead(s, max) + fmt.Sprintf(
-				"\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>",
-				len(s), lines, path)
+			// Two notice forms, longest first; a tight cap gets the short one.
+			// The notice counts against max when it can, so the head shrinks to
+			// make room. When even the short form does not fit, the head keeps its
+			// full cap and the notice is appended past it: the pointer is the only
+			// way back to the content, so it is the one thing worth spending bytes
+			// outside the budget on. The bound below therefore applies to the
+			// OUTPUT; a spill result is bounded to max + the notice.
+			forms := []string{
+				"\n\n... <persisted-output>[Output too large: full " +
+					fmt.Sprintf("%d bytes / %d lines. Full output saved to  %s </persisted-output>", len(s), lines, path),
+				"\n\n... <persisted-output>[Full output saved to  " + path + " </persisted-output>",
+			}
+			for _, notice := range forms {
+				budget := max - len(notice)
+				if budget < 0 {
+					budget = max
+				}
+				return cutHead(s, budget) + notice
+			}
 		}
 	}
 	return truncate(s, max)
@@ -109,16 +129,92 @@ func resolvePath(tc *ToolContext, p string) string {
 	return filepath.Join(tc.WorkingDir, p)
 }
 
-// truncate trims s to max bytes, keeping head and tail. Both cuts are aligned to
-// rune boundaries (see cutHead/cutTail): slicing bytes blindly can split a
-// multi-byte character, and the mojibake then travels into the model's context
+// withinWorkspace reports whether p lands inside workdir. An empty workdir
+// confines nothing (a host that did not name a workspace gets no boundary).
+//
+// Lexical resolution only: this stops a path ARGUMENT from climbing out with
+// ".." or an absolute path. It does not follow symlinks, so it is not a defence
+// against someone who can already plant a link inside the workspace.
+func withinWorkspace(workdir, p string) bool {
+	if workdir == "" {
+		return true
+	}
+	root, err := filepath.Abs(workdir)
+	if err != nil {
+		return false
+	}
+	abs := p
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(root, abs)
+	}
+	abs = filepath.Clean(abs)
+	rel, err := filepath.Rel(root, abs)
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
+// inputPath reads the path argument a file tool was given ("file_path" for the
+// file tools, "path" for LS/Glob/Grep).
+func inputPath(input json.RawMessage) string {
+	var in struct {
+		FilePath string `json:"file_path"`
+		Path     string `json:"path"`
+	}
+	_ = json.Unmarshal(input, &in)
+	if in.FilePath != "" {
+		return in.FilePath
+	}
+	return in.Path
+}
+
+// readPathPermissions auto-allows a read that stays inside the workspace and
+// asks for one that leaves it.
+//
+// Why this exists: read-only tools are auto-allowed by the pipeline, and Read
+// takes an absolute path verbatim. Without this check, `Read ~/.ssh/id_rsa` is
+// approved by nobody and its contents go into the model's context — that is, to
+// the model provider.
+func readPathPermissions(_ context.Context, input json.RawMessage, pc permission.Context) permission.Decision {
+	if p := inputPath(input); p != "" && !withinWorkspace(pc.WorkingDir, p) {
+		return permission.AskUser("read outside the workspace: " + p)
+	}
+	return permission.Allowed()
+}
+
+// editPathPermissions always asks. It returns Ask, not Allow, so acceptEdits'
+// auto-allow does not fire on it (the pipeline never auto-allows a tool whose
+// own check wants a human), and it names the escape when there is one.
+func editPathPermissions(_ context.Context, input json.RawMessage, pc permission.Context) permission.Decision {
+	p := inputPath(input)
+	if p != "" && !withinWorkspace(pc.WorkingDir, p) {
+		return permission.AskUser("edit outside the workspace: " + p)
+	}
+	return permission.AskUser("edit " + p)
+}
+
+// truncate trims s to at most max bytes, keeping head and tail. Both cuts are
+// aligned to rune boundaries (see cutHead/cutTail): slicing bytes blindly can split
+// a multi-byte character, and the mojibake then travels into the model's context
 // (and into transcripts) as invalid UTF-8.
+//
+// The notice counts against max, so the result never exceeds what the caller
+// asked for. A caller who says "30000" and gets 30_060 has no bound at all.
 func truncate(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
 	}
-	half := max / 2
-	return cutHead(s, half) + fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", len(s)-max) + cutTail(s, half)
+	notice := fmt.Sprintf("\n\n... [%d characters truncated] ...\n\n", len(s)-max)
+	budget := max - len(notice)
+	if budget <= 0 {
+		return cutHead(s, max)
+	}
+	half := budget / 2
+	return cutHead(s, half) + notice + cutTail(s, half)
 }
 
 // byteSeq is string or []byte: both index to a byte, so the rune-boundary

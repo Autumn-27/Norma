@@ -27,7 +27,7 @@ func NewRead() CoreTool {
 		},
 		ReadOnly:    always,
 		Concurrent:  always,
-		Permissions: allowReadOnly,
+		Permissions: readPathPermissions,
 		Run:         runRead,
 	})
 }
@@ -156,7 +156,8 @@ func NewWrite() CoreTool {
 			},
 			"required": []any{"file_path", "content"},
 		},
-		Run: runWrite,
+		Permissions: editPathPermissions,
+		Run:         runWrite,
 	})
 }
 
@@ -207,7 +208,8 @@ func NewEdit() CoreTool {
 			},
 			"required": []any{"file_path", "old_string", "new_string"},
 		},
-		Run: runEdit,
+		Permissions: editPathPermissions,
+		Run:         runEdit,
 	})
 }
 

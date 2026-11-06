@@ -23,7 +23,7 @@ func NewLS() CoreTool {
 		},
 		ReadOnly:    always,
 		Concurrent:  always,
-		Permissions: allowReadOnly,
+		Permissions: readPathPermissions,
 		Run:         runLS,
 	})
 }

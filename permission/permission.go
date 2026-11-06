@@ -67,8 +67,10 @@ type Context struct {
 // stage (FR-05.1, C-02).
 type CanUseTool func(ctx context.Context, toolName string, input json.RawMessage, pc Context) Decision
 
-// editTools are auto-allowed under ModeAcceptEdits.
-var editTools = map[string]bool{"Write": true, "Edit": true, "NotebookEdit": true}
+// editTools are auto-allowed under ModeAcceptEdits. Every mutating file tool in
+// package tool must be listed here, or the implement-after-approval flow
+// (plan mode flips to AcceptEdits) stops at the first call of the missing one.
+var editTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true}
 
 // Request bundles everything Evaluate needs without importing the tool package.
 type Request struct {
@@ -85,7 +87,7 @@ type Request struct {
 // over every mode, including bypass.
 func Evaluate(ctx context.Context, req Request) Decision {
 	// Stage 1 — deny rules (absolute priority).
-	if matchRule(req.Ctx.Disallowed, req.ToolName) {
+	if matchRule(req.Ctx.Disallowed, req.ToolName, req.Input) {
 		return Denied("denied: tool '" + req.ToolName + "' is disallowed by policy")
 	}
 	// A tool that hard-denies (e.g. failed self-validation) is also absolute.
@@ -105,13 +107,16 @@ func Evaluate(ctx context.Context, req Request) Decision {
 	}
 
 	// Stage 3 — allow rules and mode-based auto-allows.
-	if matchRule(req.Ctx.Allowed, req.ToolName) {
+	if matchRule(req.Ctx.Allowed, req.ToolName, req.Input) {
 		return Allowed()
 	}
 	if req.Ctx.Mode == ModeAcceptEdits && editTools[req.ToolName] {
 		return Allowed()
 	}
-	if req.IsReadOnly {
+	// A read-only tool is auto-allowed unless its own check asks for a human.
+	// The tool sees its input, this pipeline only sees the name, so a read that
+	// reaches outside the workspace is the tool's to escalate.
+	if req.IsReadOnly && req.ToolDecision.Behavior != Ask {
 		return Allowed()
 	}
 	if req.ToolDecision.Behavior == Allow {
@@ -135,17 +140,63 @@ func Evaluate(ctx context.Context, req Request) Decision {
 	return Denied("denied: no approval handler configured for '" + req.ToolName + "'")
 }
 
-// matchRule reports whether toolName matches any rule. A rule is either a bare
-// tool name, "*" (any), or "Name(...)" whose Name part matches.
-func matchRule(rules []string, toolName string) bool {
+// matchRule reports whether a call matches any rule. Accepted forms:
+//
+//	"*"             any tool
+//	"Read"          exactly that tool
+//	"Bash(git:*)"   Bash whose command starts with "git"
+//
+// A parenthesized rule on any other tool matches nothing. Granting a rule this
+// code cannot evaluate would hand out far more than the rule says; matching
+// nothing hands out less, which is the direction a permission boundary must
+// fail in.
+func matchRule(rules []string, toolName string, input json.RawMessage) bool {
 	for _, r := range rules {
 		r = strings.TrimSpace(r)
 		if r == "*" || r == toolName {
 			return true
 		}
-		if i := strings.IndexByte(r, '('); i > 0 && r[:i] == toolName {
+		name, arg, ok := splitRule(r)
+		if !ok || name != toolName {
+			continue
+		}
+		if commandPrefixMatches(toolName, arg, input) {
 			return true
 		}
 	}
 	return false
+}
+
+// splitRule splits "Name(arg)" into its parts.
+func splitRule(r string) (name, arg string, ok bool) {
+	i := strings.IndexByte(r, '(')
+	if i <= 0 || !strings.HasSuffix(r, ")") {
+		return "", "", false
+	}
+	return r[:i], r[i+1 : len(r)-1], true
+}
+
+// commandPrefixMatches applies "Bash(git:*)" to the command about to run. Only
+// Bash is understood — it is the one tool whose input has a prefix a policy can
+// usefully name. The trailing ":*" is the prefix marker; "Bash(git)" is the
+// same rule written without it.
+func commandPrefixMatches(toolName, arg string, input json.RawMessage) bool {
+	if toolName != "Bash" {
+		return false
+	}
+	prefix := strings.TrimSuffix(strings.TrimSpace(arg), "*")
+	prefix = strings.TrimSuffix(prefix, ":")
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return false
+	}
+	var in struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(input, &in) != nil {
+		return false
+	}
+	cmd := strings.TrimSpace(in.Command)
+	// A word boundary, so "git:*" matches "git status" but not "gitleaks".
+	return cmd == prefix || strings.HasPrefix(cmd, prefix+" ")
 }

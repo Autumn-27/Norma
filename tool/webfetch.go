@@ -5,9 +5,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -31,6 +34,11 @@ type WebFetchConfig struct {
 	// InsecureTLS skips TLS certificate verification entirely (equivalent to
 	// curl -k). A blunt fallback when no CA cert is available; prefer CACert.
 	InsecureTLS bool
+	// AllowPrivate permits connections to loopback, private and link-local
+	// addresses. Off by default: a fetch is the one tool that can be steered by a
+	// page the model read, and 169.254.169.254 is one request away. Enable it for
+	// a lab, an intranet crawler, or a test server on localhost.
+	AllowPrivate bool
 }
 
 // NewWebFetch builds the WebFetch tool: fetches a URL over HTTP(S) and returns
@@ -69,14 +77,18 @@ const maxFetchBytes = 2 << 20 // 2 MiB
 
 // newFetchClient returns an HTTP client honoring the proxy / TLS config.
 func newFetchClient(cfg WebFetchConfig) *http.Client {
-	if cfg.Proxy == "" && !cfg.InsecureTLS && cfg.CACert == "" {
-		return &http.Client{}
-	}
 	tr := &http.Transport{}
 	if cfg.Proxy != "" {
 		if pu, err := url.Parse(cfg.Proxy); err == nil {
 			tr.Proxy = http.ProxyURL(pu)
 		}
+	} else if !cfg.AllowPrivate {
+		// No proxy: the dial target is the host the model named, so this is the
+		// one place that can keep a fetch on the public internet. It runs after
+		// DNS resolution and again for every redirect hop, which a URL-string
+		// check would not. Behind a proxy the target is the operator's proxy,
+		// which may legitimately be local, so the guard is skipped there.
+		tr.DialContext = guardDialContext
 	}
 	switch {
 	case cfg.InsecureTLS:
@@ -95,6 +107,62 @@ func newFetchClient(cfg WebFetchConfig) *http.Client {
 		}
 	}
 	return &http.Client{Transport: tr}
+}
+
+// errPrivateAddress is returned instead of connecting to an address that is not
+// on the public internet.
+var errPrivateAddress = errors.New("blocked: the address is not on the public internet (loopback, private, link-local, metadata or CGNAT range)")
+
+// guardDialContext resolves the host, drops every answer that is not public, and
+// dials only what is left. Resolving here rather than checking the URL string is
+// what closes DNS rebinding: the address that was checked is the address dialed.
+func guardDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	var dialer net.Dialer
+	for _, ip := range ips {
+		if !isPublicAddr(ip) {
+			lastErr = errPrivateAddress
+			continue
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errPrivateAddress
+	}
+	return nil, lastErr
+}
+
+// isPublicAddr reports whether an address is routable on the public internet.
+// CGNAT (100.64.0.0/10) is listed by hand: netip does not call it private, and
+// several clouds expose internal services inside it.
+func isPublicAddr(a netip.Addr) bool {
+	a = a.Unmap()
+	if !a.IsValid() {
+		return false
+	}
+	if a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
+		a.IsMulticast() || a.IsUnspecified() || a.IsInterfaceLocalMulticast() {
+		return false
+	}
+	if a.Is4() {
+		v4 := a.As4()
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return false
+		}
+	}
+	return true
 }
 
 // proxyLikelyErr reports whether a fetch error is the kind a recording/MITM proxy
@@ -163,7 +231,7 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 	// otherwise-reachable URL. nil when no proxy is configured (nothing to bypass).
 	var direct *http.Client
 	if cfg.Proxy != "" {
-		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS})
+		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS, AllowPrivate: cfg.AllowPrivate})
 	}
 	return func(ctx context.Context, input json.RawMessage, _ *ToolContext) (Result, error) {
 		var in struct {

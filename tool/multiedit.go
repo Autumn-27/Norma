@@ -36,7 +36,8 @@ func NewMultiEdit() CoreTool {
 			},
 			"required": []any{"file_path", "edits"},
 		},
-		Run: runMultiEdit,
+		Permissions: editPathPermissions,
+		Run:         runMultiEdit,
 	})
 }
 

@@ -168,9 +168,32 @@ var nonInteractiveEnv = []string{
 	"DEBIAN_FRONTEND=noninteractive",
 }
 
+// secretMarkers are the name fragments that make an inherited variable a
+// credential. Substring, not suffix, so AWS_SECRET_ACCESS_KEY and
+// ANTHROPIC_API_KEY are both caught. Deliberately narrow: a false positive
+// costs a host one line in ToolContext.Env, a false negative leaks a key.
+var secretMarkers = []string{"API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PRIVATE_KEY"}
+
+// secretEnvKey reports whether an inherited variable looks like a credential.
+func secretEnvKey(k string) bool {
+	u := strings.ToUpper(k)
+	for _, m := range secretMarkers {
+		if strings.Contains(u, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // withEnv builds the child environment, in precedence order:
 //
-//	process environment  <  nonInteractiveEnv defaults  <  the host's extra vars
+//	process environment (minus secrets) < nonInteractiveEnv defaults < the host's extra vars
+//
+// Secrets are dropped from the inherited layer (see secretEnvKey): a shell the
+// model can run is a shell that can run `env`, and whatever it prints ends up in
+// the conversation, the transcript file and the provider's logs. A host that
+// genuinely needs one of these in the child names it in extra, which is applied
+// last and never filtered.
 //
 // Each layer is applied by DROPPING the earlier entry for that key rather than
 // appending a duplicate. os/exec's own dedup would resolve duplicates in favour
@@ -199,7 +222,8 @@ func withEnv(extra []string) []string {
 	base := os.Environ()
 	out := make([]string, 0, len(base)+len(nonInteractiveEnv)+len(extra))
 	for _, kv := range base {
-		if k := envKey(kv); k != "" && drop[k] {
+		k := envKey(kv)
+		if k != "" && (drop[k] || secretEnvKey(k)) {
 			continue
 		}
 		out = append(out, kv)

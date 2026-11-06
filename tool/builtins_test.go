@@ -169,7 +169,7 @@ func TestWebFetch(t *testing.T) {
 	}))
 	defer srv.Close()
 	raw, _ := json.Marshal(map[string]any{"url": srv.URL})
-	res, err := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+	res, err := NewWebFetch(WebFetchConfig{AllowPrivate: true}).Call(context.Background(), raw, &ToolContext{})
 	if err != nil {
 		t.Fatalf("webfetch: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestWebFetchRejectsStaticAssets(t *testing.T) {
 	// .js/.css (and with a query string), images, fonts → rejected before any request.
 	for _, path := range []string{"/app.js", "/main.css", "/bundle.min.js?v=3", "/logo.png", "/font.woff2"} {
 		raw, _ := json.Marshal(map[string]any{"url": srv.URL + path})
-		res, err := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+		res, err := NewWebFetch(WebFetchConfig{AllowPrivate: true}).Call(context.Background(), raw, &ToolContext{})
 		if err != nil {
 			t.Fatalf("webfetch %s: %v", path, err)
 		}
@@ -207,7 +207,7 @@ func TestWebFetchRejectsStaticAssets(t *testing.T) {
 
 	// A normal page path still works.
 	raw, _ := json.Marshal(map[string]any{"url": srv.URL + "/docs/guide"})
-	res, _ := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+	res, _ := NewWebFetch(WebFetchConfig{AllowPrivate: true}).Call(context.Background(), raw, &ToolContext{})
 	if res.IsError {
 		t.Fatalf("normal page path should not be rejected: %q", res.Flatten())
 	}
@@ -253,7 +253,7 @@ func TestWebFetchProxyFallback(t *testing.T) {
 	}))
 	defer srv.Close()
 	raw, _ := json.Marshal(map[string]any{"url": srv.URL})
-	res, err := NewWebFetch(WebFetchConfig{Proxy: "http://127.0.0.1:1"}).Call(context.Background(), raw, &ToolContext{})
+	res, err := NewWebFetch(WebFetchConfig{Proxy: "http://127.0.0.1:1", AllowPrivate: true}).Call(context.Background(), raw, &ToolContext{})
 	if err != nil {
 		t.Fatalf("webfetch: %v", err)
 	}
@@ -344,12 +344,12 @@ func TestWebFetchCACert(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{"url": srv.URL})
 
 	// No CA → the self-signed cert fails verification.
-	res, _ := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+	res, _ := NewWebFetch(WebFetchConfig{AllowPrivate: true}).Call(context.Background(), raw, &ToolContext{})
 	if out := res.Flatten(); !strings.Contains(out, "Error fetching URL") {
 		t.Fatalf("expected TLS failure without CA, got: %q", out)
 	}
 	// CA trusted → verification passes, content fetched.
-	res, _ = NewWebFetch(WebFetchConfig{CACert: caFile}).Call(context.Background(), raw, &ToolContext{})
+	res, _ = NewWebFetch(WebFetchConfig{CACert: caFile, AllowPrivate: true}).Call(context.Background(), raw, &ToolContext{})
 	if out := res.Flatten(); !strings.Contains(out, "secure") {
 		t.Fatalf("expected success with CA, got: %q", out)
 	}
@@ -357,7 +357,7 @@ func TestWebFetchCACert(t *testing.T) {
 
 func mustFetch(t *testing.T, raw []byte) string {
 	t.Helper()
-	res, err := NewWebFetch(WebFetchConfig{}).Call(context.Background(), raw, &ToolContext{})
+	res, err := NewWebFetch(WebFetchConfig{AllowPrivate: true}).Call(context.Background(), raw, &ToolContext{})
 	if err != nil {
 		t.Fatalf("webfetch: %v", err)
 	}
