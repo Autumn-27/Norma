@@ -173,3 +173,40 @@ func TestCountUsesMessagesForAPI(t *testing.T) {
 		t.Fatalf("count should ignore pre-boundary history: got %d, want 1", got)
 	}
 }
+
+// The thresholds were tuned for a 200k window. Below roughly 60k the flat
+// buffer (13000) and summary reservation invert them: autoThreshold drops under
+// microThreshold, and on a 20k window it goes negative, so AutoCompact fires on
+// every single request and pays for a summarizer call each turn.
+func TestThresholdsStayOrderedOnSmallWindows(t *testing.T) {
+	for _, window := range []int{8_000, 20_000, 32_000, 64_000, 200_000, 1_000_000} {
+		c := New(Config{ContextWindow: window}, nil)
+		ew, auto, micro := c.effectiveWindow(), c.autoThreshold(), c.microThreshold()
+		if ew <= 0 {
+			t.Fatalf("window=%d: effectiveWindow=%d, want positive", window, ew)
+		}
+		if auto <= micro {
+			t.Fatalf("window=%d: autoThreshold=%d <= microThreshold=%d — the tiers are inverted",
+				window, auto, micro)
+		}
+		// The prediction must be able to be FALSE: an empty context cannot already
+		// be over the limit, or AutoCompact runs forever.
+		if c.predictiveOver(0) {
+			t.Fatalf("window=%d: predictiveOver(0) is true — every request compacts", window)
+		}
+	}
+}
+
+// The default window must keep the values it had before the caps were added.
+func TestThresholdsUnchangedOnDefaultWindow(t *testing.T) {
+	c := New(Config{ContextWindow: 200_000}, nil)
+	if got := c.buffer(); got != 13000 {
+		t.Fatalf("buffer = %d, want 13000", got)
+	}
+	if got := c.maxTurnGrowth(); got != 23000 {
+		t.Fatalf("maxTurnGrowth = %d, want 23000", got)
+	}
+	if got := c.autoThreshold(); got != 192000-13000 {
+		t.Fatalf("autoThreshold = %d, want %d", got, 192000-13000)
+	}
+}

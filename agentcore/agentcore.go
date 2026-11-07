@@ -357,7 +357,20 @@ func (s *Session) Messages() []llm.Message { return s.messages }
 func (s *Session) Usage() llm.Usage { return s.usage }
 
 // Reset clears the conversation.
-func (s *Session) Reset() { s.messages = nil; s.usage = llm.Usage{} }
+//
+// Background tasks go with it. They outlive a turn by design, so a host that
+// resets to start a new conversation would otherwise keep the old one's
+// processes running and have their completion notifications injected into the
+// new conversation — referencing tasks it never started. The task directory
+// survives (same session id), so nothing that is still addressable is deleted.
+func (s *Session) Reset() {
+	s.messages = nil
+	s.usage = llm.Usage{}
+	if s.tasks != nil {
+		s.tasks.KillAll()
+		s.tasks.DrainNotifications()
+	}
+}
 
 // SessionID returns the transcript session id (empty if persistence is off).
 func (s *Session) SessionID() string { return s.sessionID }

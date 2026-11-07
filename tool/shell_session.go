@@ -14,11 +14,16 @@ import (
 	"github.com/hinshun/vt10x"
 )
 
-// Interactive PTY shell sessions (docs/交互式shell设计.md). A session is a persistent
+// Interactive PTY shell sessions. A session is a persistent
 // pseudo-terminal running an interactive program (msfconsole / ssh / a REPL / …) that
 // the agent drives by sending input (text / named keys / raw bytes) and reading output
 // incrementally (raw stream) or as a rendered screen snapshot (vt10x). Sessions live on
 // the per-Session task Manager (tc.Tasks) and are cleaned up with it.
+//
+// These sessions run arbitrary commands, so the tools that open and drive them
+// are gated exactly like Bash (see shell_tools.go): the safety floor plus the
+// host's approval callback. The session is not a permission boundary — opening
+// one approved does not make what is typed into it approved.
 
 // Tunables.
 const (
@@ -65,7 +70,7 @@ type ptySession struct {
 	lastOut  time.Time
 	exitedAt time.Time
 
-	readCur  int64 // tool-side read cursor (shell_read without since_cursor continues here)
+	readCur  int64         // tool-side read cursor (shell_read without since_cursor continues here)
 	notifyCh chan struct{} // pinged on new output
 	done     chan struct{} // closed when the process exits
 }

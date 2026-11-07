@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/norma/permission"
@@ -70,12 +71,22 @@ func bashPermissions(_ context.Context, input json.RawMessage, _ permission.Cont
 		Command string `json:"command"`
 	}
 	_ = json.Unmarshal(input, &in)
-	for _, re := range catastrophicBash {
-		if re.MatchString(in.Command) {
-			return permission.Denied("denied: command appears irreversibly destructive and is blocked by the safety floor")
-		}
+	if bad := catastrophicCommand(in.Command); bad != "" {
+		return permission.Denied(bad)
 	}
 	return permission.AskUser("run shell command: " + in.Command)
+}
+
+// catastrophicCommand returns a denial message when cmd matches the safety
+// floor, "" otherwise. Shared by every entry point that runs shell text, so the
+// floor cannot be bypassed by using a different tool to reach a shell.
+func catastrophicCommand(cmd string) string {
+	for _, re := range catastrophicBash {
+		if re.MatchString(cmd) {
+			return "denied: command appears irreversibly destructive and is blocked by the safety floor"
+		}
+	}
+	return ""
 }
 
 func runBash(ctx context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
@@ -184,29 +195,95 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	} else {
 		cmd.Env = withEnv(nil)
 	}
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// Same isolation as the managed path: the child gets its own process group,
+	// so a timeout can kill the whole tree instead of orphaning grandchildren.
+	// CommandContext's default killer signals only the direct child, which is
+	// exactly the grandchild leak this replaces.
+	setDetached(cmd)
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			treeKill(cmd.Process)
+		}
+		return nil
+	}
+	out := &syncCapBuffer{max: maxTaskOutputBytes, cmd: cmd}
+	cmd.Stdout = out
+	cmd.Stderr = out
 	err := cmd.Run()
 
-	out := Capture(tc, buf.String())
+	text := Capture(tc, out.String())
+	if out.Overflowed() {
+		return Errorf(text + fmt.Sprintf(
+			"\n\n[terminated: output exceeded the %s per-command cap]",
+			humanBytes(maxTaskOutputBytes))), nil
+	}
 	if cctx.Err() == context.DeadlineExceeded {
-		return Errorf(out + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
+		return Errorf(text + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			if out == "" {
-				out = "(no output)"
+			if text == "" {
+				text = "(no output)"
 			}
-			return Errorf(fmt.Sprintf("%s\n\n[exit code %d]", out, ee.ExitCode())), nil
+			return Errorf(fmt.Sprintf("%s\n\n[exit code %d]", text, ee.ExitCode())), nil
 		}
-		return Errorf(fmt.Sprintf("%s\n\n[failed to run: %v]", out, err)), nil
+		return Errorf(fmt.Sprintf("%s\n\n[failed to run: %v]", text, err)), nil
 	}
-	if strings.TrimSpace(out) == "" {
-		out = "(command produced no output)"
+	if strings.TrimSpace(text) == "" {
+		text = "(command produced no output)"
 	}
-	return Text(out), nil
+	return Text(text), nil
+}
+
+// syncCapBuffer bounds a foreground command's output held in memory.
+//
+// The managed path caps the output file on disk; this path has no file, so
+// without a cap a command like `yes` grows a bytes.Buffer until the host is
+// OOM-killed — taking the unsaved transcript with it. On overflow the process
+// group is killed immediately and Overflowed reports the termination, matching
+// the managed path's oversize behaviour.
+type syncCapBuffer struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	max  int
+	over bool
+	cmd  *exec.Cmd
+}
+
+func (b *syncCapBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	if !b.over {
+		if room := b.max - b.buf.Len(); room > 0 {
+			b.buf.Write(p[:min(len(p), room)])
+		}
+		if b.buf.Len() >= b.max {
+			b.over = true
+			if b.cmd != nil {
+				if proc := b.cmd.Process; proc != nil {
+					go treeKill(proc) // outside the lock: the child is still writing
+				}
+			}
+		}
+	}
+	b.mu.Unlock()
+	// Report full acceptance: a short write would surface as an I/O error in the
+	// child and change what the model sees, when the point is to terminate it.
+	return len(p), nil
+}
+
+// String returns what was captured before the cap.
+func (b *syncCapBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Overflowed reports whether the cap was reached and the command killed.
+func (b *syncCapBuffer) Overflowed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.over
 }
 
 // autoBackgroundAllowed reports whether a timed-out command may be moved to the

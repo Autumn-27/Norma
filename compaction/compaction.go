@@ -94,26 +94,46 @@ func (c *Compactor) reservedForSummary() int {
 	if r > 20000 || r == 0 {
 		r = 20000
 	}
+	// Never reserve more than half the window. A host pointing this at a local
+	// model with a small window (a 20k context with MaxOutputTokens unset
+	// reserves a flat 20000) would otherwise leave an effective window of zero
+	// and every threshold below it.
+	if half := c.cfg.ContextWindow / 2; half > 0 && r > half {
+		r = half
+	}
 	return r
 }
 func (c *Compactor) effectiveWindow() int { return c.cfg.ContextWindow - c.reservedForSummary() }
 
 // buffer tiers off the EFFECTIVE window (== claude-code getAutocompactBufferTokens).
+//
+// The tier values were tuned for a 200k window. Capped at a quarter of the
+// effective window so they cannot swallow a small one: a flat 13000 on a 20k
+// window pushed autoThreshold below microThreshold (and, with the summary
+// reservation, below zero), so AutoCompact fired on every request and paid for
+// a summarizer call each turn. The cap is inert at and above a 52k window.
 func (c *Compactor) buffer() int {
+	var b int
 	switch ew := c.effectiveWindow(); {
 	case ew >= 800000:
-		return 50000
+		b = 50000
 	case ew >= 400000:
-		return 30000
+		b = 30000
 	default:
-		return 13000
+		b = 13000
 	}
+	return min(b, max(c.effectiveWindow()/4, 0))
 }
 func (c *Compactor) autoThreshold() int  { return c.effectiveWindow() - c.buffer() }
 func (c *Compactor) microThreshold() int { return c.effectiveWindow() * 6 / 10 }
 
 // maxTurnGrowth == claude-code estimateMaxTurnGrowth: min(maxOutput,20000)+15000.
-func (c *Compactor) maxTurnGrowth() int { return c.reservedForSummary() + toolResultGrowthGuess }
+// maxTurnGrowth caps at a quarter of the effective window for the same reason as
+// buffer: a flat 23000 makes predictiveOver true for tiny windows no matter how
+// empty the context actually is.
+func (c *Compactor) maxTurnGrowth() int {
+	return min(c.reservedForSummary()+toolResultGrowthGuess, max(c.effectiveWindow()/4, 1000))
+}
 func (c *Compactor) predictiveOver(tok int) bool {
 	return tok+c.maxTurnGrowth() > c.effectiveWindow()
 }

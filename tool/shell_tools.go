@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/Autumn-27/norma/permission"
@@ -12,7 +13,13 @@ import (
 
 // The interactive-shell tool family (opt-in; NOT in DefaultTools). ShellSessionTools
 // returns all five. They require a task Manager on the ToolContext (tc.Tasks) — that is
-// where the PTY sessions live and get cleaned up. See docs/交互式shell设计.md.
+// where the PTY sessions live and get cleaned up.
+//
+// These tools run arbitrary commands, so they are gated exactly like Bash: the
+// catastrophic-command floor plus the host's approval callback. A shell that
+// reasoned "I already asked once, at open time" would be an escalation path —
+// open a REPL under approval, then type anything into it unapproved — so
+// shell_send is gated too, not just shell_open.
 
 // ShellSessionTools returns the five interactive-shell tools. Callers add them to
 // Options.Tools only when interactive shell is enabled for the agent.
@@ -20,16 +27,40 @@ func ShellSessionTools() []CoreTool {
 	return []CoreTool{NewShellOpen(), NewShellSend(), NewShellRead(), NewShellClose(), NewShellList()}
 }
 
-func sessTool(name, desc string, schema map[string]any, readOnly bool, run func(context.Context, json.RawMessage, *ToolContext) (Result, error)) CoreTool {
+func sessTool(name, desc string, schema map[string]any, readOnly bool,
+	perms func(context.Context, json.RawMessage, permission.Context) permission.Decision,
+	run func(context.Context, json.RawMessage, *ToolContext) (Result, error)) CoreTool {
 	return Build(Spec{
 		Name: name, Description: desc, Schema: schema,
-		ReadOnly:   func(json.RawMessage) bool { return readOnly },
-		Concurrent: func(json.RawMessage) bool { return false },
-		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
-			return permission.Allowed()
-		},
-		Run: run,
+		ReadOnly:    func(json.RawMessage) bool { return readOnly },
+		Concurrent:  func(json.RawMessage) bool { return false },
+		Permissions: perms,
+		Run:         run,
 	})
+}
+
+// shellExecPermissions gates text that a live shell will execute.
+//
+// shell_send types into an already-approved shell, so "the session was approved
+// once" cannot be the whole answer: `shell_open "python3"` followed by a send
+// would otherwise run anything with no floor and no callback.
+func shellExecPermissions(fields ...string) func(context.Context, json.RawMessage, permission.Context) permission.Decision {
+	return func(_ context.Context, input json.RawMessage, _ permission.Context) permission.Decision {
+		var in map[string]json.RawMessage
+		_ = json.Unmarshal(input, &in)
+		var text strings.Builder
+		for _, f := range fields {
+			var v string
+			if raw, ok := in[f]; ok && json.Unmarshal(raw, &v) == nil {
+				text.WriteString(v)
+				text.WriteString("\n")
+			}
+		}
+		if bad := catastrophicCommand(text.String()); bad != "" {
+			return permission.Denied(bad)
+		}
+		return permission.AskUser("send to interactive shell: " + short(text.String()))
+	}
 }
 
 func obj(props map[string]any, required ...string) map[string]any {
@@ -86,7 +117,7 @@ func NewShellOpen() CoreTool {
 		"quiet_ms":         intProp("可选：静默多少毫秒算完成(默认 8000)"),
 		"startup_grace_ms": intProp("可选：启动宽限毫秒，此期间不触发静默判定(默认 15000)"),
 	}, "command")
-	return sessTool("shell_open", desc, schema, false, func(ctx context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
+	return sessTool("shell_open", desc, schema, false, bashPermissions, func(ctx context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
 		m, errR := sessManager(tc)
 		if errR != nil {
 			return *errR, nil
@@ -177,7 +208,7 @@ func NewShellSend() CoreTool {
 		"quiet_ms":     intProp("可选：静默判定阈值毫秒(默认 8000)"),
 		"timeout_ms":   intProp("可选：wait 的硬超时毫秒(默认 120000)"),
 	}, "session_id")
-	return sessTool("shell_send", desc, schema, false, func(ctx context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
+	return sessTool("shell_send", desc, schema, false, shellExecPermissions("text", "paste"), func(ctx context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
 		m, errR := sessManager(tc)
 		if errR != nil {
 			return *errR, nil
@@ -260,7 +291,7 @@ func NewShellRead() CoreTool {
 		"drain":        boolProp("stream: true=返回自上次以来全部原始流(忽略上限)"),
 	}, "session_id")
 	// per-session read cursor kept here (tool-side) so unspecified reads continue.
-	return sessTool("shell_read", desc, schema, true, func(_ context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
+	return sessTool("shell_read", desc, schema, true, allowReadOnly, func(_ context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
 		m, errR := sessManager(tc)
 		if errR != nil {
 			return *errR, nil
@@ -309,7 +340,7 @@ func NewShellRead() CoreTool {
 // NewShellClose 关闭会话。
 func NewShellClose() CoreTool {
 	schema := obj(map[string]any{"session_id": strProp("会话 id")}, "session_id")
-	return sessTool("shell_close", "关闭一个交互会话(杀掉进程、释放 PTY)。", schema, false, func(_ context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
+	return sessTool("shell_close", "关闭一个交互会话(杀掉进程、释放 PTY)。", schema, false, allowReadOnly, func(_ context.Context, in json.RawMessage, tc *ToolContext) (Result, error) {
 		m, errR := sessManager(tc)
 		if errR != nil {
 			return *errR, nil
@@ -333,7 +364,7 @@ func NewShellClose() CoreTool {
 
 // NewShellList 列出会话。
 func NewShellList() CoreTool {
-	return sessTool("shell_list", "列出当前所有交互会话及状态。", obj(map[string]any{}), true, func(_ context.Context, _ json.RawMessage, tc *ToolContext) (Result, error) {
+	return sessTool("shell_list", "列出当前所有交互会话及状态。", obj(map[string]any{}), true, allowReadOnly, func(_ context.Context, _ json.RawMessage, tc *ToolContext) (Result, error) {
 		m, errR := sessManager(tc)
 		if errR != nil {
 			return *errR, nil
