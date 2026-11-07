@@ -23,6 +23,7 @@ func NewMultiEdit() CoreTool {
 				"edits": map[string]any{
 					"type":        "array",
 					"description": "Edits to apply in order.",
+					"minItems":    1,
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
@@ -81,7 +82,10 @@ func runMultiEdit(_ context.Context, input json.RawMessage, tc *ToolContext) (Re
 		}
 		total += count
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := atomicReplace(path, func(f *os.File) error {
+		_, err := f.WriteString(content)
+		return err
+	}); err != nil {
 		return Errorf(fmt.Sprintf("Error writing %s: %v", in.FilePath, err)), nil
 	}
 	return Text(fmt.Sprintf("Applied %d edits to %s (%d replacement(s))", len(in.Edits), in.FilePath, total)), nil

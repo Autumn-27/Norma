@@ -215,9 +215,10 @@ func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 }
 
 // NewExecuteExtraTool builds the always-loaded invoker for deferred tools. It runs
-// the named tool from reg, but only if it is currently in the unlock set. Schema is
-// validated before the call. unlock may be nil (then every registry tool is
-// callable — no gating).
+// the named tool from reg, but only if it is currently in the unlock set.
+// ToolContext.InvokeTool must run the target through the host's full execution
+// pipeline; unlocking never substitutes for permission. A nil unlock disables
+// only unlock gating, not authorization.
 func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 	return Build(Spec{
 		Name: ExecuteExtraToolName,
@@ -251,7 +252,10 @@ func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 			if args.ToolName == "" {
 				return Errorf("Error: tool_name is required"), nil
 			}
-			t, ok := reg.Get(args.ToolName)
+			if args.ToolName == ExecuteExtraToolName || args.ToolName == SearchExtraToolsName {
+				return Errorf("Error: deferred access tools cannot invoke themselves or each other"), nil
+			}
+			_, ok := reg.Get(args.ToolName)
 			if !ok {
 				return Errorf("Error: unknown tool " + args.ToolName), nil
 			}
@@ -263,10 +267,10 @@ func NewExecuteExtraTool(reg *Registry, unlock *UnlockSet) CoreTool {
 			if len(params) == 0 {
 				params = json.RawMessage("{}")
 			}
-			if err := ValidateInput(t.InputSchema(), params); err != nil {
-				return Errorf("Error: invalid params for " + args.ToolName + ": " + err.Error()), nil
+			if tc == nil || tc.InvokeTool == nil {
+				return Errorf("Error: deferred tool execution requires a permission-aware host dispatcher"), nil
 			}
-			return t.Call(ctx, params, tc)
+			return tc.InvokeTool(args.ToolName, params)
 		},
 	})
 }

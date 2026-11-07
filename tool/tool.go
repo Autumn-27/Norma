@@ -47,6 +47,10 @@ type ToolContext struct {
 	// DEBIAN_FRONTEND — see tool.nonInteractiveEnv), which override any value
 	// inherited for those four keys. Naming one here is how a host takes it back.
 	Env []string
+	// InvokeTool dispatches a nested call through the host's full schema,
+	// permission and hook pipeline. Deferred tools must use this rather than
+	// calling a registry tool directly. Nil means nested dispatch is unavailable.
+	InvokeTool func(name string, input json.RawMessage) (Result, error)
 }
 
 func (tc *ToolContext) progress(msg string) {

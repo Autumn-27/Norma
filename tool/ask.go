@@ -49,14 +49,18 @@ func NewAskUserQuestion(ask AskUserFunc) CoreTool {
 				"questions": map[string]any{
 					"type":        "array",
 					"description": "1-4 questions to ask.",
+					"minItems":    1,
+					"maxItems":    4,
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"header":      map[string]any{"type": "string", "description": "Very short label (≤12 chars)."},
+							"header":      map[string]any{"type": "string", "description": "Very short label (≤12 chars).", "maxLength": 12},
 							"question":    map[string]any{"type": "string", "description": "The question to ask."},
 							"multiSelect": map[string]any{"type": "boolean", "description": "Allow multiple selections."},
 							"options": map[string]any{
-								"type": "array",
+								"type":     "array",
+								"minItems": 2,
+								"maxItems": 4,
 								"items": map[string]any{
 									"type": "object",
 									"properties": map[string]any{

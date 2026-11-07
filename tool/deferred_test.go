@@ -85,16 +85,25 @@ func TestExecuteExtraTool(t *testing.T) {
 	reg := NewRegistry(echoTool())
 	unlock := NewUnlockSet("echo")
 	exec := NewExecuteExtraTool(reg, unlock)
+	// The tool delegates to the host; the harness integration tests below the
+	// package boundary exercise the real permission and hook pipeline.
+	tc := &ToolContext{InvokeTool: func(name string, params json.RawMessage) (Result, error) {
+		tl, _ := reg.Get(name)
+		if err := ValidateInput(tl.InputSchema(), params); err != nil {
+			return Errorf("invalid params: " + err.Error()), nil
+		}
+		return tl.Call(context.Background(), params, nil)
+	}}
 
 	// unlocked → runs
-	r, _ := exec.Call(context.Background(), json.RawMessage(`{"tool_name":"echo","params":{"msg":"hi"}}`), nil)
+	r, _ := exec.Call(context.Background(), json.RawMessage(`{"tool_name":"echo","params":{"msg":"hi"}}`), tc)
 	if r.IsError || r.Content[0].Text != "echo:hi" {
 		t.Fatalf("expected echo:hi, got %+v", r)
 	}
 
 	// locked → rejected
 	locked := NewExecuteExtraTool(reg, NewUnlockSet())
-	r, _ = locked.Call(context.Background(), json.RawMessage(`{"tool_name":"echo","params":{"msg":"hi"}}`), nil)
+	r, _ = locked.Call(context.Background(), json.RawMessage(`{"tool_name":"echo","params":{"msg":"hi"}}`), tc)
 	if !r.IsError || !strings.Contains(r.Content[0].Text, "not unlocked") {
 		t.Fatalf("locked tool should be rejected, got %+v", r)
 	}
@@ -106,8 +115,26 @@ func TestExecuteExtraTool(t *testing.T) {
 	}
 
 	// invalid params (missing required msg) → schema validation error
-	r, _ = exec.Call(context.Background(), json.RawMessage(`{"tool_name":"echo","params":{}}`), nil)
+	r, _ = exec.Call(context.Background(), json.RawMessage(`{"tool_name":"echo","params":{}}`), tc)
 	if !r.IsError || !strings.Contains(r.Content[0].Text, "invalid params") {
 		t.Fatalf("invalid params should error, got %+v", r)
+	}
+}
+
+func TestExecuteExtraToolRequiresDispatcher(t *testing.T) {
+	reg := NewRegistry(echoTool())
+	tl := NewExecuteExtraTool(reg, NewUnlockSet("echo"))
+	for _, tc := range []*ToolContext{nil, {}} {
+		r, _ := tl.Call(context.Background(), json.RawMessage(`{"tool_name":"echo","params":{"msg":"hi"}}`), tc)
+		if !r.IsError || !strings.Contains(r.Flatten(), "dispatcher") {
+			t.Fatalf("must fail closed: %+v", r)
+		}
+	}
+	for _, name := range []string{ExecuteExtraToolName, SearchExtraToolsName} {
+		raw, _ := json.Marshal(map[string]any{"tool_name": name})
+		r, _ := tl.Call(context.Background(), raw, &ToolContext{InvokeTool: func(string, json.RawMessage) (Result, error) { t.Fatal("recursive dispatch"); return Result{}, nil }})
+		if !r.IsError {
+			t.Fatal("access tool recursion was allowed")
+		}
 	}
 }

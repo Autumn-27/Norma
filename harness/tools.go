@@ -92,6 +92,12 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 		Tasks:          l.in.Tasks,
 		Env:            l.in.BashEnv,
 	}
+	tc.InvokeTool = func(name string, input json.RawMessage) (tool.Result, error) {
+		block, extra := l.execOne(llm.ContentBlock{
+			ID: use.ID, Name: name, Input: input,
+		}, emitProgress)
+		return tool.Result{Content: block.Content, IsError: block.IsError, Extra: extra}, nil
+	}
 	// toolCtx carries the run's MaxDuration deadline, so a tool that overruns the
 	// wall-clock budget is interrupted here (the turn loop then enters wrap-up). During
 	// the wrap-up phase toolCtx is the live parent ctx, so settlement tools run freely.
