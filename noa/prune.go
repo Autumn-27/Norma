@@ -141,6 +141,12 @@ func prune(io NodeIO, _ PipelineContext) NodeIO {
 		return anchors[i].blockNum < anchors[j].blockNum
 	})
 
+	// Repair a view that would end on a summary. Un-covering happens before the
+	// rebuild, and only ever frees messages, so the strip passes stay monotone.
+	if len(anchors) > 0 {
+		repairSummaryTail(io.Messages, covered, anchors[len(anchors)-1].insertAt)
+	}
+
 	out := make([]CoreMessage, 0, len(io.Messages)+len(anchors))
 	next := 0
 	for i, m := range io.Messages {
@@ -250,6 +256,39 @@ func stripOrphanedReasoning(msgs []CoreMessage) []CoreMessage {
 		}
 	}
 	return out
+}
+
+// repairSummaryTail un-covers the newest message when the view would otherwise
+// END on a summary.
+//
+// A summary is emitted at its anchor, before the message at that index. If every
+// message from the last anchor onward is covered, the summary becomes the last
+// thing the model sees — a bare role:user "[Compressed conversation section] …"
+// with nothing asked in it. Models answer it instead of continuing the task
+// ("No, the message says only … with no request"). Coverage can reach the tail
+// after the fact: a tier promotion widens a block's effective span past what the
+// protected zone excluded when the block was created, so this cannot be caught
+// at compress time.
+//
+// Only a plain trailing message is rescued. A trailing tool exchange is left to
+// the orphan stripping below, which has its own, older rule for that shape.
+func repairSummaryTail(msgs []CoreMessage, covered map[string]bool, lastAnchor int) {
+	if n := len(msgs); n > 0 && msgs[n-1].ContentType != CTText {
+		return
+	}
+	for i := lastAnchor; i < len(msgs); i++ {
+		if !covered[msgs[i].ID] {
+			return
+		}
+	}
+	for i := len(msgs) - 1; i >= lastAnchor; i-- {
+		if msgs[i].ID != "" {
+			delete(covered, msgs[i].ID)
+		}
+		if msgs[i].ContentType != CTToolResult {
+			return
+		}
+	}
 }
 
 // keepReasoningForVisibleTurns un-covers the reasoning run of any turn that

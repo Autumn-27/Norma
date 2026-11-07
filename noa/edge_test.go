@@ -62,8 +62,9 @@ func TestPruneWithBlockCoveringNothing(t *testing.T) {
 	}
 }
 
-// Every message covered means the view is just the summary plus the protected
-// first user message.
+// Everything covered still leaves the summary plus the first user message, and
+// never a summary last: the newest message is rescued so the model has
+// something to continue from instead of answering the summary itself.
 func TestPruneEverythingCovered(t *testing.T) {
 	st := CreateInitialState("s", "/a")
 	st.Blocks = []CompressionBlock{block("b1", 1, "a", "b", "c")}
@@ -73,8 +74,14 @@ func TestPruneEverythingCovered(t *testing.T) {
 		msg("c", RoleAssistant, CTText, "third"),
 	}
 	got := pruneWith(msgs, st)
-	if len(got) != 2 {
-		t.Fatalf("got %v, want the summary plus the preserved first user message", ids(got))
+	gotIDs := strings.Join(ids(got), ",")
+	for _, want := range []string{SummaryMessageID("b1"), "a", "c"} {
+		if !strings.Contains(gotIDs, want) {
+			t.Fatalf("prune = %v, want it to contain %q", ids(got), want)
+		}
+	}
+	if last := got[len(got)-1]; isRenderedSummaryMessage(last) {
+		t.Fatalf("prune = %v, ends on a summary — the model answers it instead of the task", ids(got))
 	}
 }
 

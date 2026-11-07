@@ -166,10 +166,56 @@ func ValidateConfig(c Config) []string {
 	return w
 }
 
+// preserveRecentTokens resolves the tail protection in tokens, capped so a
+// small window still has room left to compress.
+//
+// A flat 5000 protects 83% of a 6k window, and compression can then never run
+// at all — the whole point of the floor is "leave the newest work alone", not
+// "leave everything alone". Large windows are unaffected: 5000 stays well under
+// a quarter of them.
+func (c Config) preserveRecentTokens() int {
+	n := c.PreserveRecentTokens
+	if c.ModelContextLimit <= 0 {
+		return n
+	}
+	if lim := max(c.ModelContextLimit/4, 500); n > lim {
+		return lim
+	}
+	return n
+}
+
+// minCompressRangeChars resolves the per-batch floor in characters (~4 per
+// token), capped at a twentieth of the window.
+//
+// The floor exists to reject a trivial range, not to demand a fifth of the
+// context. On a 6k window the flat 5000 made every compressible range too small
+// to qualify; above ~62k it is already under a twentieth, so nothing changes.
+func (c Config) minCompressRangeChars() int {
+	n := c.Compress.MinCompressRange
+	if c.ModelContextLimit <= 0 {
+		return n
+	}
+	if lim := max(c.ModelContextLimit*4/20, 800); n > lim {
+		return lim
+	}
+	return n
+}
+
 // minPressureBenefit resolves the configured floor or its default.
+// minPressureBenefit resolves the smallest reclaim it is worth interrupting for.
+//
+// The 5000-token default only scales above a 500k window — the max() means it is
+// a constant everywhere else. On a 6k window that demands a single reclaimable
+// range worth 83% of the context, so the pressure nudge never fires and nothing
+// is ever compressed. Cap it at a quarter of the window; the default is already
+// under that for any window above 20k, so nothing else changes.
 func (c Config) minPressureBenefit() int {
+	n := max(5000, roundHalfUp(float64(c.ModelContextLimit)*0.01))
 	if c.Nudge.MinPressureBenefitTokens != nil {
 		return *c.Nudge.MinPressureBenefitTokens
 	}
-	return max(5000, roundHalfUp(float64(c.ModelContextLimit)*0.01))
+	if c.ModelContextLimit <= 0 {
+		return n
+	}
+	return min(n, max(c.ModelContextLimit/4, 800))
 }

@@ -224,7 +224,7 @@ func ApplyCompression(in ApplyInput) ApplyResult {
 // to resubmit the entire batch.
 func checkSizeGate(entries []rangeEntry, in ApplyInput, count TokenCountFn,
 	unknownCount, consumedCount, resolvable int) (string, bool) {
-	minChars := in.Config.Compress.MinCompressRange
+	minChars := in.Config.minCompressRangeChars()
 	if minChars <= 0 {
 		return "", false
 	}

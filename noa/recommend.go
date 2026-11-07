@@ -48,10 +48,10 @@ func ComputeProtectedRefs(msgs []CoreMessage, state CompressionState, cfg Config
 			out[v.ref] = true
 		}
 	}
-	if cfg.PreserveRecentTokens > 0 {
+	if tail := cfg.preserveRecentTokens(); tail > 0 {
 		acc := 0
 		for i := len(visible) - 1; i >= 0; i-- {
-			if acc >= cfg.PreserveRecentTokens {
+			if acc >= tail {
 				break
 			}
 			out[visible[i].ref] = true
@@ -267,7 +267,7 @@ func ViableRanges(ranges []RangeInfo) []RangeInfo {
 func BuildRecommendation(msgs []CoreMessage, state CompressionState, cfg Config, count TokenCountFn) Recommendation {
 	protectedRefs := ComputeProtectedRefs(msgs, state, cfg)
 	ranges, protectedRuns := BuildCompressibleRanges(msgs, state, cfg, protectedRefs, count)
-	merged := MergeRangesToThreshold(ranges, cfg.Compress.MinCompressRange)
+	merged := MergeRangesToThreshold(ranges, cfg.minCompressRangeChars())
 	viable := ViableRanges(merged)
 	return Recommendation{
 		CompressibleRanges: viable,

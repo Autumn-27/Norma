@@ -172,3 +172,35 @@ func TestIsNeverPreserveRecentTool(t *testing.T) {
 		}
 	}
 }
+
+// The tail protection and the compression floor are absolute defaults; on a
+// small window they must shrink with it or nothing is ever compressible. A flat
+// 5000-token tail on a 6k window protects 83% of the context.
+func TestTokenFloorsScaleWithSmallWindows(t *testing.T) {
+	small := DefaultConfig(6_000)
+	if got := small.preserveRecentTokens(); got >= 6_000 {
+		t.Fatalf("preserveRecentTokens on a 6k window = %d, want well under the window", got)
+	}
+	if got := small.minCompressRangeChars(); got >= 6_000*4 {
+		t.Fatalf("minCompressRangeChars on a 6k window = %d chars, want less than the whole window", got)
+	}
+
+	// A normal window keeps the configured values untouched.
+	normal := DefaultConfig(200_000)
+	if got := normal.preserveRecentTokens(); got != normal.PreserveRecentTokens {
+		t.Fatalf("preserveRecentTokens on a 200k window = %d, want %d", got, normal.PreserveRecentTokens)
+	}
+	if got := normal.minCompressRangeChars(); got != normal.Compress.MinCompressRange {
+		t.Fatalf("minCompressRangeChars on a 200k window = %d, want %d", got, normal.Compress.MinCompressRange)
+	}
+
+	// An unknown window keeps the configured values: guessing downwards would
+	// silently disable both protections.
+	unknown := DefaultConfig(0)
+	if got := unknown.preserveRecentTokens(); got != unknown.PreserveRecentTokens {
+		t.Fatalf("preserveRecentTokens with no window = %d, want %d", got, unknown.PreserveRecentTokens)
+	}
+	if got := unknown.minCompressRangeChars(); got != unknown.Compress.MinCompressRange {
+		t.Fatalf("minCompressRangeChars with no window = %d, want %d", got, unknown.Compress.MinCompressRange)
+	}
+}

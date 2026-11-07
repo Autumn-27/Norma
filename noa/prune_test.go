@@ -115,7 +115,9 @@ func TestPruneOrdersByCoveragePosition(t *testing.T) {
 		msg("m4", RoleAssistant, CTText, "b"),
 	}
 	got := pruneWith(msgs, st)
-	want := []string{"m1", SummaryMessageID("b1"), "m3", SummaryMessageID("b2")}
+	// m4 survives: b2 spans it and m4 is the last message, so leaving it covered
+	// would end the request on the b2 summary with nothing asked after it.
+	want := []string{"m1", SummaryMessageID("b1"), "m3", SummaryMessageID("b2"), "m4"}
 	if strings.Join(ids(got), ",") != strings.Join(want, ",") {
 		t.Fatalf("prune = %v, want %v", ids(got), want)
 	}
@@ -368,5 +370,26 @@ func TestArchiveTagIsNotARefTag(t *testing.T) {
 	}
 	if strings.Contains(tag, ` id="m`) {
 		t.Fatalf("archive tag %q must not carry an id=\"mNNNNN\" attribute", tag)
+	}
+}
+
+// A block whose span reaches the end of the conversation must not leave the
+// request ending on its summary: the model has nothing to answer there, and
+// answers the summary instead ("No, the message says only … with no request").
+func TestPruneNeverEndsOnASummary(t *testing.T) {
+	st := CreateInitialState("s", "/tmp")
+	st.Blocks = []CompressionBlock{block("b1", 1, "m2", "m3", "m4")}
+	msgs := []CoreMessage{
+		msg("m1", RoleUser, CTText, "task"),
+		msg("m2", RoleAssistant, CTText, "a"),
+		msg("m3", RoleAssistant, CTText, "b"),
+		msg("m4", RoleAssistant, CTText, "newest"),
+	}
+	got := pruneWith(msgs, st)
+	if last := got[len(got)-1]; isRenderedSummaryMessage(last) {
+		t.Fatalf("prune = %v, ends on a summary", ids(got))
+	}
+	if got[len(got)-1].ID != "m4" {
+		t.Fatalf("prune = %v, want the newest message last", ids(got))
 	}
 }
