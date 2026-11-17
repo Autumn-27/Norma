@@ -136,6 +136,11 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		if title == "" {
 			title = keenableDefaultTitle
 		}
+		// The title goes into an HTTP header, so reject anything that could
+		// split or corrupt it (CR, LF and other control characters).
+		if strings.IndexFunc(title, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return nil, fmt.Errorf("web_search: Keenable title must not contain control characters or newlines")
+		}
 		key := strings.TrimSpace(cfg.KeenableAPIKey)
 		endpoint := keenablePublicEndpoint
 		if key != "" {
@@ -502,6 +507,14 @@ func (p *keenableProvider) Search(ctx context.Context, query string, limit int) 
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// Keyless calls are rate-limited per IP; pass Retry-After through so
+		// the caller (and the model) knows when to try again.
+		if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" {
+			return nil, fmt.Errorf("Keenable Search rate limited (HTTP 429), Retry-After: %s", ra)
+		}
+		return nil, fmt.Errorf("Keenable Search rate limited (HTTP 429)")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("Keenable Search returned HTTP %d", resp.StatusCode)
 	}

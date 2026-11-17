@@ -189,6 +189,30 @@ func TestKeenableHTTPError(t *testing.T) {
 	}
 }
 
+func TestKeenableRateLimitRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	p := &keenableProvider{title: "Norma", client: srv.Client(), endpoint: srv.URL}
+	_, err := p.Search(context.Background(), "q", 5)
+	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "Retry-After: 17") {
+		t.Fatalf("want 429 error carrying Retry-After, got %v", err)
+	}
+}
+
+func TestKeenableTitleRejectsControlChars(t *testing.T) {
+	for _, title := range []string{"ARTEX\r\nX-Evil: 1", "AR\nTEX", "AR\tTEX"} {
+		if _, err := newSearchProvider(WebSearchConfig{Backend: "keenable", KeenableTitle: title}); err == nil {
+			t.Errorf("title %q should be rejected", title)
+		}
+	}
+	if _, err := newSearchProvider(WebSearchConfig{Backend: "keenable", KeenableTitle: "ARTEX"}); err != nil {
+		t.Errorf("plain title should build: %v", err)
+	}
+}
+
 func TestKeenableEndpointSelection(t *testing.T) {
 	pub, err := newSearchProvider(WebSearchConfig{Backend: "keenable"})
 	if err != nil {
