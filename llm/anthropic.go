@@ -45,6 +45,12 @@ type anthropicTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"input_schema"`
+	// CacheControl places an Anthropic prompt-cache breakpoint on THIS tool
+	// entry. Anthropic semantics: the breakpoint covers everything up to and
+	// including the marked block, so marking the LAST tool caches the whole
+	// tool-schema section (which is session-fixed in agentcore — the same
+	// content every turn is exactly what cache breakpoints are for).
+	CacheControl map[string]any `json:"cache_control,omitempty"`
 }
 
 func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
@@ -73,6 +79,18 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 	}
 	for _, t := range req.Tools {
 		body.Tools = append(body.Tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+	}
+	// Tool-schema cache breakpoint (FR-02.3): when the caller opted into prompt
+	// caching via DynamicBoundary, mark the LAST tool too — agentcore's tool set
+	// is session-fixed, so the whole tools section is byte-stable across turns
+	// and caching it saves the full schema size on every subsequent request.
+	// Skill-gated tool unlocks mutate the list, which rewrites this cache once
+	// and is inherent to Anthropic's prefix-caching (the system breakpoint above
+	// stays valid regardless). Anthropic-compatible emulations that reject
+	// cache_control on tools are rare; if one surfaces, gate via caller-side
+	// DynamicBoundary (0 = no system AND no tool breakpoint).
+	if req.DynamicBoundary > 0 && len(body.Tools) > 0 {
+		body.Tools[len(body.Tools)-1].CacheControl = map[string]any{"type": "ephemeral"}
 	}
 	if thinkingType != "" {
 		body.Thinking = &anthropicThinking{Type: thinkingType}
