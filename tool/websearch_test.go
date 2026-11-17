@@ -25,6 +25,12 @@ func TestNewWebSearchConfig(t *testing.T) {
 	if _, err := NewWebSearch(WebSearchConfig{Backend: "nope"}); err == nil {
 		t.Fatal("unknown backend should error")
 	}
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "keenable"}); err != nil {
+		t.Fatalf("keenable backend should build without a key: %v", err)
+	}
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "keenable", KeenableAPIKey: "k"}); err != nil {
+		t.Fatalf("keenable backend with key should build: %v", err)
+	}
 }
 
 func TestDDGSSearchParse(t *testing.T) {
@@ -111,11 +117,139 @@ func TestBraveHTTPError(t *testing.T) {
 	}
 }
 
+func TestKeenableSearchParse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("want POST, got %s", r.Method)
+		}
+		if got := r.Header.Get("X-Keenable-Title"); got != "Norma" {
+			t.Errorf("missing/incorrect title header: %q", got)
+		}
+		if got := r.Header.Get("X-API-Key"); got != "" {
+			t.Errorf("keyless call should not send X-API-Key, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"query":"q","mode":"pro","results":[
+			{"title":"T1","url":"https://a.example","snippet":"S1"},
+			{"title":"No URL","snippet":"dropped"},
+			{"title":"T2","url":"https://b.example","snippet":"S2"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	p := &keenableProvider{title: "Norma", client: srv.Client(), endpoint: srv.URL}
+	res, err := p.Search(context.Background(), "q", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 2 || res[0].Title != "T1" || res[0].Description != "S1" || res[1].URL != "https://b.example" {
+		t.Fatalf("bad parse: %+v", res)
+	}
+	if res[0].Position != 1 || res[1].Position != 2 {
+		t.Errorf("positions not 1-indexed: %d %d", res[0].Position, res[1].Position)
+	}
+
+	res, _ = p.Search(context.Background(), "q", 1)
+	if len(res) != 1 {
+		t.Errorf("limit=1 should yield 1 result, got %d", len(res))
+	}
+}
+
+func TestKeenableKeyedAuth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "secret-key" {
+			t.Errorf("missing/incorrect auth header: %q", got)
+		}
+		if got := r.Header.Get("X-Keenable-Title"); got != "ARTEX" {
+			t.Errorf("title should still be sent on the keyed path: %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"T","url":"https://a.example","snippet":"S"}]}`))
+	}))
+	defer srv.Close()
+
+	p := &keenableProvider{apiKey: "secret-key", title: "ARTEX", client: srv.Client(), endpoint: srv.URL}
+	res, err := p.Search(context.Background(), "q", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 1 || res[0].Title != "T" {
+		t.Fatalf("bad parse: %+v", res)
+	}
+}
+
+func TestKeenableHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	p := &keenableProvider{apiKey: "k", title: "Norma", client: srv.Client(), endpoint: srv.URL}
+	if _, err := p.Search(context.Background(), "q", 5); err == nil {
+		t.Fatal("expected error on HTTP 401")
+	}
+}
+
+func TestKeenableRateLimitRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	p := &keenableProvider{title: "Norma", client: srv.Client(), endpoint: srv.URL}
+	_, err := p.Search(context.Background(), "q", 5)
+	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "Retry-After: 17") {
+		t.Fatalf("want 429 error carrying Retry-After, got %v", err)
+	}
+}
+
+func TestKeenableTitleRejectsControlChars(t *testing.T) {
+	for _, title := range []string{"ARTEX\r\nX-Evil: 1", "AR\nTEX", "AR\tTEX"} {
+		if _, err := newSearchProvider(WebSearchConfig{Backend: "keenable", KeenableTitle: title}); err == nil {
+			t.Errorf("title %q should be rejected", title)
+		}
+	}
+	if _, err := newSearchProvider(WebSearchConfig{Backend: "keenable", KeenableTitle: "ARTEX"}); err != nil {
+		t.Errorf("plain title should build: %v", err)
+	}
+}
+
+func TestKeenableEndpointSelection(t *testing.T) {
+	pub, err := newSearchProvider(WebSearchConfig{Backend: "keenable"})
+	if err != nil {
+		t.Fatalf("keyless keenable should build: %v", err)
+	}
+	kp, ok := pub.(*keenableProvider)
+	if !ok {
+		t.Fatalf("want *keenableProvider, got %T", pub)
+	}
+	if kp.endpoint != keenablePublicEndpoint || kp.apiKey != "" || kp.title != keenableDefaultTitle {
+		t.Errorf("keyless defaults: endpoint=%q key=%q title=%q", kp.endpoint, kp.apiKey, kp.title)
+	}
+
+	keyed, err := newSearchProvider(WebSearchConfig{Backend: "keenable", KeenableAPIKey: " k ", KeenableTitle: " ARTEX "})
+	if err != nil {
+		t.Fatalf("keyed keenable should build: %v", err)
+	}
+	kp = keyed.(*keenableProvider)
+	if kp.endpoint != keenableKeyedEndpoint || kp.apiKey != "k" || kp.title != "ARTEX" {
+		t.Errorf("keyed config: endpoint=%q key=%q title=%q", kp.endpoint, kp.apiKey, kp.title)
+	}
+
+	// Empty backend must still default to ddgs, not keenable.
+	def, err := newSearchProvider(WebSearchConfig{})
+	if err != nil {
+		t.Fatalf("empty backend should build: %v", err)
+	}
+	if def.Name() != "ddgs" {
+		t.Errorf("empty backend defaulted to %q, want ddgs", def.Name())
+	}
+}
+
 func TestUnwrapDDGHref(t *testing.T) {
 	cases := map[string]string{
 		"//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.com%2Fy&rut=z": "https://x.com/y",
-		"https://plain.example/path":                            "https://plain.example/path",
-		"":                                                      "",
+		"https://plain.example/path":                             "https://plain.example/path",
+		"":                                                       "",
 	}
 	for in, want := range cases {
 		if got := unwrapDDGHref(in); got != want {

@@ -106,8 +106,10 @@ type Options struct {
 	// EnableWebSearch adds the network-facing web_search tool (permission-gated).
 	EnableWebSearch bool
 	// WebSearchBackend selects the search backend: "ddgs" (DuckDuckGo, no key),
-	// "brave-free" (Brave Search API), "tavily" (Tavily Search API), or
-	// "deepseek" (DeepSeek's server-side search). Empty defaults to "ddgs".
+	// "brave-free" (Brave Search API), "tavily" (Tavily Search API),
+	// "keenable" (Keenable Search; keyless, or keyed via KeenableSearchAPIKey),
+	// or "deepseek" (DeepSeek's server-side search). Empty defaults to "ddgs".
+	// Keenable is opt-in only — it is never selected by an empty backend.
 	WebSearchBackend string
 	// BraveSearchAPIKey authenticates the "brave-free" backend. Required only when
 	// WebSearchBackend == "brave-free".
@@ -115,6 +117,14 @@ type Options struct {
 	// TavilySearchAPIKey authenticates the "tavily" backend. Required only when
 	// WebSearchBackend == "tavily".
 	TavilySearchAPIKey string
+	// KeenableSearchAPIKey optionally authenticates the "keenable" backend.
+	// Empty uses Keenable's keyless public endpoint. Only used when
+	// WebSearchBackend == "keenable".
+	KeenableSearchAPIKey string
+	// KeenableSearchTitle is sent as X-Keenable-Title (required on the keyless
+	// path). Empty defaults to "Norma" in the tool. Only used when
+	// WebSearchBackend == "keenable".
+	KeenableSearchTitle string
 	// DeepSeekSearch* configure the "deepseek" backend, which has no search API
 	// of its own: it spends one call on DeepSeek's Anthropic-format messages
 	// endpoint per search (the web_search_20250305 server tool). BaseURL must be
@@ -292,7 +302,7 @@ func NewSession(opts Options) *Session {
 		// A misconfigured backend (unknown name, or brave-free without a key)
 		// drops the tool rather than failing the whole session — the rest of the
 		// agent stays usable and the missing tool surfaces the misconfig.
-		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
+		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, KeenableAPIKey: opts.KeenableSearchAPIKey, KeenableTitle: opts.KeenableSearchTitle, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
 			tools = append(tools, ws)
 		}
 	}
