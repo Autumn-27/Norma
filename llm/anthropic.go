@@ -30,7 +30,9 @@ type anthropicReq struct {
 	Stream        bool                   `json:"stream"`
 }
 
-// anthropicThinking is the "thinking":{"type":"enabled"|"disabled"} switch.
+// anthropicThinking is the "thinking":{"type":...} switch. "enabled"/"disabled"
+// are the classic extended-thinking modes; "adaptive" is the newer mode used by
+// 5.5-generation models (paired with output_config.effort instead of a budget).
 type anthropicThinking struct {
 	Type string `json:"type"`
 }
@@ -54,14 +56,13 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 	}
 	// Effective thinking mode: a non-empty per-request override (req.Thinking)
 	// wins over Config.ThinkingType. Thinking-type content blocks may be replayed
-	// only when thinking is actively "enabled"; any other mode (incl. "disabled")
+	// only when thinking is on ("enabled" or "adaptive"); "disabled" or empty
 	// strips them so Anthropic does not reject the request.
 	thinkingType := p.cfg.ThinkingType
-	thinkingEnabled := thinkingType != ""
 	if req.Thinking != "" {
 		thinkingType = req.Thinking
-		thinkingEnabled = req.Thinking == "enabled"
 	}
+	thinkingEnabled := thinkingType == "enabled" || thinkingType == "adaptive"
 	body := anthropicReq{
 		Model:         p.cfg.Model,
 		Messages:      mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, thinkingEnabled)),
