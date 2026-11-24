@@ -35,8 +35,9 @@ type searchProvider interface {
 type WebSearchConfig struct {
 	// Backend chooses the provider: "ddgs" (DuckDuckGo scrape, no key),
 	// "brave-free" (Brave Search API, needs BraveAPIKey), "tavily" (Tavily
-	// Search API, needs TavilyAPIKey), or "deepseek" (DeepSeek's server-side
-	// web search, needs DeepSeek*). Empty defaults to "ddgs".
+	// Search API, needs TavilyAPIKey), "keenable" (Keenable Search; keyless
+	// public endpoint, or keyed via KeenableAPIKey), or "deepseek" (DeepSeek's
+	// server-side web search, needs DeepSeek*). Empty defaults to "ddgs".
 	Backend string
 	// BraveAPIKey authenticates the "brave-free" backend. Required (and only
 	// used) when Backend == "brave-free".
@@ -44,6 +45,14 @@ type WebSearchConfig struct {
 	// TavilyAPIKey authenticates the "tavily" backend. Required (and only
 	// used) when Backend == "tavily".
 	TavilyAPIKey string
+	// KeenableAPIKey optionally authenticates the "keenable" backend. When set,
+	// requests go to the keyed /v1/search endpoint; when empty, the keyless
+	// /v1/search/public endpoint is used (X-Keenable-Title is always sent).
+	// Keenable is opt-in: it is only used when Backend == "keenable".
+	KeenableAPIKey string
+	// KeenableTitle is sent as X-Keenable-Title. Empty defaults to "Norma".
+	// Required by the keyless public endpoint; also sent on the keyed path.
+	KeenableTitle string
 	// DeepSeekBaseURL / DeepSeekAPIKey / DeepSeekModel configure the "deepseek"
 	// backend. That backend does NOT call a search API — DeepSeek has none.
 	// Search there only exists inside its Anthropic-compatible messages endpoint
@@ -122,6 +131,22 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 			return nil, fmt.Errorf("web_search: backend %q requires a Tavily API key", backend)
 		}
 		return &tavilyProvider{apiKey: key, client: client, endpoint: tavilyEndpoint}, nil
+	case "keenable":
+		title := strings.TrimSpace(cfg.KeenableTitle)
+		if title == "" {
+			title = keenableDefaultTitle
+		}
+		// The title goes into an HTTP header, so reject anything that could
+		// split or corrupt it (CR, LF and other control characters).
+		if strings.IndexFunc(title, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return nil, fmt.Errorf("web_search: Keenable title must not contain control characters or newlines")
+		}
+		key := strings.TrimSpace(cfg.KeenableAPIKey)
+		endpoint := keenablePublicEndpoint
+		if key != "" {
+			endpoint = keenableKeyedEndpoint
+		}
+		return &keenableProvider{apiKey: key, title: title, client: client, endpoint: endpoint}, nil
 	case "deepseek":
 		key := strings.TrimSpace(cfg.DeepSeekAPIKey)
 		if key == "" {
@@ -137,7 +162,7 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		}
 		return &deepseekProvider{apiKey: key, model: model, client: client, endpoint: deepseekMessagesURL(base)}, nil
 	default:
-		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", or \"deepseek\")", backend)
+		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", \"keenable\", or \"deepseek\")", backend)
 	}
 }
 
@@ -427,6 +452,95 @@ func (p *tavilyProvider) Search(ctx context.Context, query string, limit int) ([
 			Title:       r.Title,
 			URL:         r.URL,
 			Description: r.Content,
+			Position:    len(out) + 1,
+		})
+	}
+	return out, nil
+}
+
+const (
+	keenablePublicEndpoint = "https://api.keenable.ai/v1/search/public"
+	keenableKeyedEndpoint  = "https://api.keenable.ai/v1/search"
+	keenableDefaultTitle   = "Norma"
+)
+
+type keenableProvider struct {
+	apiKey   string
+	title    string
+	client   *http.Client
+	endpoint string
+}
+
+func (p *keenableProvider) Name() string { return "keenable" }
+
+func (p *keenableProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	maxResults := limit
+	if maxResults < 1 {
+		maxResults = 5
+	}
+	if maxResults > 20 {
+		maxResults = 20
+	}
+	body, err := json.Marshal(map[string]any{
+		"query":              query,
+		"mode":               "pro",
+		"max_results":        maxResults,
+		"snippet_max_length": 2000,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if p.apiKey != "" {
+		req.Header.Set("X-API-Key", p.apiKey)
+	}
+	if p.title != "" {
+		req.Header.Set("X-Keenable-Title", p.title)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// Keyless calls are rate-limited per IP; pass Retry-After through so
+		// the caller (and the model) knows when to try again.
+		if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" {
+			return nil, fmt.Errorf("Keenable Search rate limited (HTTP 429), Retry-After: %s", ra)
+		}
+		return nil, fmt.Errorf("Keenable Search rate limited (HTTP 429)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Keenable Search returned HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		Results []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Snippet string `json:"snippet"`
+		} `json:"results"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("could not parse Keenable Search response: %w", err)
+	}
+	var out []SearchResult
+	for _, r := range payload.Results {
+		if r.URL == "" {
+			continue
+		}
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, SearchResult{
+			Title:       r.Title,
+			URL:         r.URL,
+			Description: r.Snippet,
 			Position:    len(out) + 1,
 		})
 	}
