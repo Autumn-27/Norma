@@ -31,6 +31,12 @@ func TestNewWebSearchConfig(t *testing.T) {
 	if _, err := NewWebSearch(WebSearchConfig{Backend: "keenable", KeenableAPIKey: "k"}); err != nil {
 		t.Fatalf("keenable backend with key should build: %v", err)
 	}
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "specstream"}); err == nil {
+		t.Fatal("specstream without a key should error")
+	}
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "specstream", SpecStreamAPIKey: "k"}); err != nil {
+		t.Fatalf("specstream backend with key should build: %v", err)
+	}
 }
 
 func TestDDGSSearchParse(t *testing.T) {
@@ -242,6 +248,115 @@ func TestKeenableEndpointSelection(t *testing.T) {
 	}
 	if def.Name() != "ddgs" {
 		t.Errorf("empty backend defaulted to %q, want ddgs", def.Name())
+	}
+}
+
+func TestSpecStreamSearchParse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("want GET, got %s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-key" {
+			t.Errorf("missing/incorrect auth header: %q", got)
+		}
+		if got := r.URL.Query().Get("q"); got != "go generics" {
+			t.Errorf("query param: %q", got)
+		}
+		if got := r.URL.Query().Get("num"); got != "5" {
+			t.Errorf("num param: %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"answer":null,"sources":[
+			{"title":"T1","url":"https://a.example","site":"a.example","snippet":"S1","cited":true},
+			{"title":"No URL","snippet":"dropped"},
+			{"title":"T2","url":"https://b.example","snippet":"S2"}
+		]}}`))
+	}))
+	defer srv.Close()
+
+	p := &specstreamProvider{apiKey: "secret-key", client: srv.Client(), endpoint: srv.URL}
+	res, err := p.Search(context.Background(), "go generics", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 2 || res[0].Title != "T1" || res[0].Description != "S1" || res[1].URL != "https://b.example" {
+		t.Fatalf("bad parse: %+v", res)
+	}
+	if res[0].Position != 1 || res[1].Position != 2 {
+		t.Errorf("positions not 1-indexed: %d %d", res[0].Position, res[1].Position)
+	}
+}
+
+func TestSpecStreamLimitClamp(t *testing.T) {
+	var gotNum []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotNum = append(gotNum, r.URL.Query().Get("num"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"sources":[{"title":"A","url":"https://a.example"},{"title":"B","url":"https://b.example"}]}}`))
+	}))
+	defer srv.Close()
+	p := &specstreamProvider{apiKey: "k", client: srv.Client(), endpoint: srv.URL}
+	res, _ := p.Search(context.Background(), "q", 1)
+	if len(res) != 1 {
+		t.Errorf("limit=1 should yield 1 result, got %d", len(res))
+	}
+	_, _ = p.Search(context.Background(), "q", 99)
+	_, _ = p.Search(context.Background(), "q", 0)
+	if len(gotNum) != 3 || gotNum[0] != "1" || gotNum[1] != "20" || gotNum[2] != "5" {
+		t.Errorf("num not clamped to 1..20 with default 5: %v", gotNum)
+	}
+}
+
+func TestSpecStreamHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	p := &specstreamProvider{apiKey: "k", client: srv.Client(), endpoint: srv.URL}
+	if _, err := p.Search(context.Background(), "q", 5); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("expected HTTP 401 error, got %v", err)
+	}
+}
+
+func TestSpecStreamDoesNotFollowRedirect(t *testing.T) {
+	var leaked bool
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		leaked = true
+	}))
+	defer dest.Close()
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, dest.URL, http.StatusFound)
+	}))
+	defer src.Close()
+
+	prov, err := newSearchProvider(WebSearchConfig{Backend: "specstream", SpecStreamAPIKey: "secret-key"})
+	if err != nil {
+		t.Fatalf("specstream should build: %v", err)
+	}
+	p := prov.(*specstreamProvider)
+	p.endpoint = src.URL
+	if _, err := p.Search(context.Background(), "q", 5); err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("want HTTP 302 error, got %v", err)
+	}
+	if leaked {
+		t.Fatal("redirect destination was contacted")
+	}
+}
+
+func TestSpecStreamConfig(t *testing.T) {
+	prov, err := newSearchProvider(WebSearchConfig{Backend: " SpecStream ", SpecStreamAPIKey: " k "})
+	if err != nil {
+		t.Fatalf("specstream should build: %v", err)
+	}
+	p, ok := prov.(*specstreamProvider)
+	if !ok {
+		t.Fatalf("want *specstreamProvider, got %T", prov)
+	}
+	if p.endpoint != specstreamEndpoint || p.apiKey != "k" || p.Name() != "specstream" {
+		t.Errorf("config: endpoint=%q key=%q name=%q", p.endpoint, p.apiKey, p.Name())
+	}
+	if _, err := newSearchProvider(WebSearchConfig{Backend: "specstream", SpecStreamAPIKey: "  "}); err == nil {
+		t.Error("blank key should be rejected")
 	}
 }
 

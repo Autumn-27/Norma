@@ -36,7 +36,8 @@ type WebSearchConfig struct {
 	// Backend chooses the provider: "ddgs" (DuckDuckGo scrape, no key),
 	// "brave-free" (Brave Search API, needs BraveAPIKey), "tavily" (Tavily
 	// Search API, needs TavilyAPIKey), "keenable" (Keenable Search; keyless
-	// public endpoint, or keyed via KeenableAPIKey), or "deepseek" (DeepSeek's
+	// public endpoint, or keyed via KeenableAPIKey), "specstream" (SpecStream
+	// Search API, needs SpecStreamAPIKey), or "deepseek" (DeepSeek's
 	// server-side web search, needs DeepSeek*). Empty defaults to "ddgs".
 	Backend string
 	// BraveAPIKey authenticates the "brave-free" backend. Required (and only
@@ -53,6 +54,9 @@ type WebSearchConfig struct {
 	// KeenableTitle is sent as X-Keenable-Title. Empty defaults to "Norma".
 	// Required by the keyless public endpoint; also sent on the keyed path.
 	KeenableTitle string
+	// SpecStreamAPIKey authenticates the "specstream" backend. Required (and
+	// only used) when Backend == "specstream". It is sent as a Bearer token.
+	SpecStreamAPIKey string
 	// DeepSeekBaseURL / DeepSeekAPIKey / DeepSeekModel configure the "deepseek"
 	// backend. That backend does NOT call a search API — DeepSeek has none.
 	// Search there only exists inside its Anthropic-compatible messages endpoint
@@ -147,6 +151,12 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 			endpoint = keenableKeyedEndpoint
 		}
 		return &keenableProvider{apiKey: key, title: title, client: client, endpoint: endpoint}, nil
+	case "specstream":
+		key := strings.TrimSpace(cfg.SpecStreamAPIKey)
+		if key == "" {
+			return nil, fmt.Errorf("web_search: backend %q requires a SpecStream API key", backend)
+		}
+		return &specstreamProvider{apiKey: key, client: noRedirectClient(client), endpoint: specstreamEndpoint}, nil
 	case "deepseek":
 		key := strings.TrimSpace(cfg.DeepSeekAPIKey)
 		if key == "" {
@@ -162,7 +172,7 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		}
 		return &deepseekProvider{apiKey: key, model: model, client: client, endpoint: deepseekMessagesURL(base)}, nil
 	default:
-		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", \"keenable\", or \"deepseek\")", backend)
+		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", \"keenable\", \"specstream\", or \"deepseek\")", backend)
 	}
 }
 
@@ -545,6 +555,85 @@ func (p *keenableProvider) Search(ctx context.Context, query string, limit int) 
 		})
 	}
 	return out, nil
+}
+
+// ─── SpecStream Search ───────────────────────────────────────────────────────
+// SpecStream Search API: GET with the query in the URL and the key as a Bearer
+// token. Ranked results come back in data.sources. The response can also hold
+// a sourced answer; this backend keeps to the result list like the others.
+
+const specstreamEndpoint = "https://api.specstream.ai/v1/web-search"
+
+type specstreamProvider struct {
+	apiKey   string
+	client   *http.Client
+	endpoint string
+}
+
+func (p *specstreamProvider) Name() string { return "specstream" }
+
+func (p *specstreamProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	num := limit
+	if num < 1 {
+		num = 5
+	}
+	if num > 20 {
+		num = 20
+	}
+	q := url.Values{}
+	q.Set("q", query)
+	q.Set("num", fmt.Sprint(num))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	req.Header.Set("Accept", "application/json")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SpecStream Search returned HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		Data struct {
+			Sources []struct {
+				Title   string `json:"title"`
+				URL     string `json:"url"`
+				Snippet string `json:"snippet"`
+			} `json:"sources"`
+		} `json:"data"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("could not parse SpecStream Search response: %w", err)
+	}
+	var out []SearchResult
+	for _, r := range payload.Data.Sources {
+		if r.URL == "" {
+			continue
+		}
+		if len(out) >= num {
+			break
+		}
+		out = append(out, SearchResult{
+			Title:       r.Title,
+			URL:         r.URL,
+			Description: r.Snippet,
+			Position:    len(out) + 1,
+		})
+	}
+	return out, nil
+}
+
+// noRedirectClient returns a copy of c that never follows a redirect, so a 30x
+// from the endpoint cannot carry the Authorization header to another URL.
+func noRedirectClient(c *http.Client) *http.Client {
+	nc := *c
+	nc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &nc
 }
 
 // ─── DeepSeek (server-side web search) ───────────────────────────────────────
